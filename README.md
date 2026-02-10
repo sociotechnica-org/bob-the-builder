@@ -81,16 +81,44 @@ PR2 adds the first D1-backed control-plane APIs:
 
 ## Getting Started
 
+Brand new local instance:
+
 ```bash
-pnpm install
-pnpm lint-all
-pnpm test
+pnpm setup
+```
+
+Start the full local stack (control worker, queue-consumer worker, and web app):
+
+```bash
+pnpm dev
+```
+
+Default local ports:
+
+- Control worker: `http://127.0.0.1:20287`
+- Queue-consumer worker: `http://127.0.0.1:20288`
+- Web app: `http://127.0.0.1:6673`
+
+Reset local runtime state and rebuild a fresh local instance:
+
+```bash
+pnpm reset
+```
+
+Common quality commands:
+
+```bash
+pnpm lint-all         # lint:fix + format:fix
+pnpm lint:check       # typecheck + lint + format:check (CI-safe)
+pnpm test             # unit + integration
+pnpm test:unit        # unit tests only
+pnpm test:integration # smoke/integration tests only
 ```
 
 Run the control worker locally:
 
 ```bash
-pnpm --filter @bob/control-worker exec wrangler d1 migrations apply DB --local --config wrangler.jsonc
+pnpm migrate
 pnpm --filter @bob/control-worker dev
 ```
 
