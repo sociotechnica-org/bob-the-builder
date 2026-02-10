@@ -861,7 +861,7 @@ describe("control worker", () => {
     expect(queue.messages).toHaveLength(1);
   });
 
-  it("recovers stale pending idempotency when both queue-failure writes fail", async () => {
+  it("does not requeue stale pending idempotency without explicit failure marker", async () => {
     const { env, db, queue } = createEnv();
     await createRepo(env);
 
@@ -896,7 +896,7 @@ describe("control worker", () => {
     expect(failedIdempotency.status).toBe("pending");
     expect(queue.messages).toHaveLength(0);
 
-    // Pending-without-marker should not immediately requeue, but it should recover once stale.
+    // Pending-without-marker should not requeue because enqueue outcome is ambiguous.
     const immediateReplay = await handleRequest(
       new Request("https://example.com/v1/runs", {
         method: "POST",
@@ -926,10 +926,7 @@ describe("control worker", () => {
     );
 
     expect(staleReplay.status).toBe(202);
-    const stalePayload = await parseJson(staleReplay);
-    const staleIdempotency = stalePayload.idempotency as Record<string, unknown>;
-    expect(staleIdempotency.requeued).toBe(true);
-    expect(queue.messages).toHaveLength(1);
+    expect(queue.messages).toHaveLength(0);
   });
 
   it("claims requeue atomically so concurrent retries enqueue only once", async () => {
@@ -1051,6 +1048,22 @@ describe("control worker", () => {
     const replayIdempotency = replayPayload.idempotency as Record<string, unknown>;
     expect(replayIdempotency.replayed).toBe(true);
     expect(replayIdempotency.status).toBe("pending");
+    expect(queue.messages).toHaveLength(1);
+
+    db.rewindIdempotencyUpdatedAt("pending-key", 31_000);
+    const staleReplay = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "pending-key"
+        }),
+        body: runBody
+      }),
+      env
+    );
+
+    expect(staleReplay.status).toBe(202);
     expect(queue.messages).toHaveLength(1);
   });
 

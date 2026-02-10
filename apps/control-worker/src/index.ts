@@ -8,7 +8,6 @@ const IDEMPOTENCY_KEY_HEADER = "idempotency-key";
 const QUEUE_FAILURE_REASON = "queue_publish_failed";
 const DEFAULT_LIST_LIMIT = 50;
 const MAX_LIST_LIMIT = 100;
-const PENDING_RETRY_STALE_MS = 30_000;
 const TEXT_ENCODER = new TextEncoder();
 
 type IdempotencyStatus = "pending" | "succeeded" | "failed";
@@ -697,34 +696,17 @@ function serializeIdempotency(
   };
 }
 
-function isStalePendingIdempotency(updatedAt: string): boolean {
-  const updatedAtMs = Date.parse(updatedAt);
-  if (Number.isNaN(updatedAtMs)) {
-    return true;
-  }
-
-  return Date.now() - updatedAtMs >= PENDING_RETRY_STALE_MS;
-}
-
 function shouldRetryQueuePublish(existingKey: IdempotencyRow, run: RunWithRepoRow): boolean {
   if (run.status !== "queued") {
     return false;
   }
 
-  if (existingKey.status === "failed") {
-    return true;
-  }
-
-  if (existingKey.status !== "pending") {
-    return false;
-  }
-
   if (run.failure_reason === QUEUE_FAILURE_REASON) {
-    return true;
+    return existingKey.status === "failed" || existingKey.status === "pending";
   }
 
-  // Recovery path when both queue-failure marker and idempotency-failed updates missed.
-  return isStalePendingIdempotency(existingKey.updated_at);
+  // Avoid duplicate queue messages: pending without explicit failure marker is ambiguous.
+  return existingKey.status === "failed";
 }
 
 async function buildReplayStateResponse(env: Env, key: string, runId: string): Promise<Response> {
