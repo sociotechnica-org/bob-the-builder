@@ -93,6 +93,7 @@ Primary persistent data lives in Cloudflare D1.
 ## Run Orchestration
 
 1. `POST /v1/runs` receives repo + issue + request metadata.
+   - Requires `Idempotency-Key` for safe retries.
 2. Control worker stores run as `queued` in D1 and enqueues message.
 3. Queue consumer starts a workflow instance.
 4. Workflow executes ordered stations:

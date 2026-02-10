@@ -24,6 +24,15 @@ export const PR_MODES = ["draft", "ready"] as const;
 
 export type PrMode = (typeof PR_MODES)[number];
 
+export interface RunQueueMessage {
+  runId: string;
+  repoId: string;
+  issueNumber: number;
+  requestedAt: string;
+  prMode: PrMode;
+  requestor: string;
+}
+
 const RUN_TRANSITIONS: Readonly<Record<RunStatus, readonly RunStatus[]>> = {
   queued: ["running", "canceled"],
   running: ["succeeded", "failed", "canceled"],
@@ -71,4 +80,21 @@ export function canTransitionStationStatus(
 
 export function isPrMode(value: string): value is PrMode {
   return PR_MODES.includes(value as PrMode);
+}
+
+export function isRunQueueMessage(value: unknown): value is RunQueueMessage {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<RunQueueMessage>;
+  return (
+    typeof candidate.runId === "string" &&
+    typeof candidate.repoId === "string" &&
+    Number.isInteger(candidate.issueNumber) &&
+    typeof candidate.requestedAt === "string" &&
+    typeof candidate.requestor === "string" &&
+    typeof candidate.prMode === "string" &&
+    isPrMode(candidate.prMode)
+  );
 }

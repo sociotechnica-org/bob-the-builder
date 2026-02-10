@@ -61,6 +61,9 @@ importers:
 
   apps/control-worker:
     dependencies:
+      "@bob/core":
+        specifier: workspace:*
+        version: link:../../packages/core
       "@bob/security":
         specifier: workspace:*
         version: link:../../packages/security

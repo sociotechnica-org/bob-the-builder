@@ -13,6 +13,7 @@
     "test:integration": "vitest run test/smoke.integration.test.ts"
   },
   "dependencies": {
+    "@bob/core": "workspace:*",
     "@bob/security": "workspace:*"
   }
 }

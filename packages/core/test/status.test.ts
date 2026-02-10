@@ -3,6 +3,7 @@ import {
   canTransitionRunStatus,
   canTransitionStationStatus,
   isPrMode,
+  isRunQueueMessage,
   isRunStatus,
   isStationName,
   isTerminalRunStatus
@@ -34,5 +35,33 @@ describe("station status contracts", () => {
 
   it("disallows completed station transitions", () => {
     expect(canTransitionStationStatus("succeeded", "failed")).toBe(false);
+  });
+});
+
+describe("run queue message contracts", () => {
+  it("accepts valid queue messages", () => {
+    expect(
+      isRunQueueMessage({
+        runId: "run_123",
+        repoId: "repo_123",
+        issueNumber: 7,
+        requestedAt: "2026-02-10T00:00:00.000Z",
+        prMode: "draft",
+        requestor: "jess"
+      })
+    ).toBe(true);
+  });
+
+  it("rejects malformed queue messages", () => {
+    expect(
+      isRunQueueMessage({
+        runId: "run_123",
+        repoId: "repo_123",
+        issueNumber: "7",
+        requestedAt: "2026-02-10T00:00:00.000Z",
+        prMode: "draft",
+        requestor: "jess"
+      })
+    ).toBe(false);
   });
 });

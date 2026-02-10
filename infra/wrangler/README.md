@@ -22,3 +22,22 @@ Expected v0 secret variables:
 - `MODAL_TOKEN_ID`
 - `MODAL_TOKEN_SECRET`
 - `CLAUDE_CODE_API_KEY`
+
+## Control Worker D1 + Queue (PR2)
+
+`apps/control-worker/wrangler.jsonc` now binds:
+
+- `DB` (D1)
+- `RUN_QUEUE` (Queue producer)
+
+Apply migrations locally before hitting repo/run endpoints:
+
+```bash
+pnpm --filter @bob/control-worker exec wrangler d1 migrations apply DB --local --config wrangler.jsonc
+```
+
+Run the worker locally:
+
+```bash
+pnpm --filter @bob/control-worker dev --local
+```
