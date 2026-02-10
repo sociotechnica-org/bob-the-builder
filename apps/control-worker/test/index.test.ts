@@ -83,6 +83,8 @@ class MockD1Database {
   private readonly runs: RunRow[] = [];
   private readonly idempotencyKeys: IdempotencyRow[] = [];
   public failNextIdempotencySucceededUpdate = false;
+  public failNextIdempotencyFailedUpdate = false;
+  public failNextRunQueueFailureMarkerUpdate = false;
 
   public prepare(sql: string): D1PreparedStatement {
     return new MockD1PreparedStatement(this, normalizeSql(sql)) as unknown as D1PreparedStatement;
@@ -208,15 +210,34 @@ class MockD1Database {
     }
 
     if (sql.startsWith("update runs")) {
-      const run = this.runs.find((row) => row.id === asString(params[3]));
-      if (!run) {
+      if (sql.includes("set failure_reason = ?")) {
+        if (this.failNextRunQueueFailureMarkerUpdate) {
+          this.failNextRunQueueFailureMarkerUpdate = false;
+          throw new Error("D1_ERROR: failed to update run queue failure marker");
+        }
+
+        const run = this.runs.find((row) => row.id === asString(params[1]));
+        if (!run) {
+          return;
+        }
+
+        run.failure_reason = asNullableString(params[0]);
         return;
       }
 
-      run.status = asString(params[0]);
-      run.failure_reason = asNullableString(params[1]);
-      run.finished_at = asNullableString(params[2]);
-      return;
+      if (sql.includes("set status = ?, failure_reason = ?, finished_at = ?")) {
+        const run = this.runs.find((row) => row.id === asString(params[3]));
+        if (!run) {
+          return;
+        }
+
+        run.status = asString(params[0]);
+        run.failure_reason = asNullableString(params[1]);
+        run.finished_at = asNullableString(params[2]);
+        return;
+      }
+
+      throw new Error(`Unsupported runs update SQL: ${sql}`);
     }
 
     if (sql.startsWith("delete from runs where id = ?")) {
@@ -250,6 +271,10 @@ class MockD1Database {
       const nextStatus = asString(params[0]) as IdempotencyRow["status"];
       if (nextStatus === "succeeded" && this.failNextIdempotencySucceededUpdate) {
         this.failNextIdempotencySucceededUpdate = false;
+        throw new Error("D1_ERROR: failed to update idempotency status");
+      }
+      if (nextStatus === "failed" && this.failNextIdempotencyFailedUpdate) {
+        this.failNextIdempotencyFailedUpdate = false;
         throw new Error("D1_ERROR: failed to update idempotency status");
       }
 
@@ -568,7 +593,7 @@ describe("control worker", () => {
     expect(failedResponse.status).toBe(503);
     const failedPayload = await parseJson(failedResponse);
     const failedRun = failedPayload.run as Record<string, unknown>;
-    expect(failedRun.status).toBe("failed");
+    expect(failedRun.status).toBe("queued");
     expect(failedRun.failureReason).toBe("queue_publish_failed");
 
     const retryResponse = await handleRequest(
@@ -588,6 +613,112 @@ describe("control worker", () => {
     const retryPayload = await parseJson(retryResponse);
     const idempotency = retryPayload.idempotency as Record<string, unknown>;
     expect(idempotency.requeued).toBe(true);
+  });
+
+  it("retries queue publish when failed idempotency update throws after enqueue error", async () => {
+    const { env, db, queue } = createEnv();
+    await createRepo(env);
+
+    queue.failNextSend = true;
+    db.failNextIdempotencyFailedUpdate = true;
+
+    const runBody = JSON.stringify({
+      repo: { owner: "sociotechnica-org", name: "lifebuild" },
+      issue: { number: 555 },
+      requestor: "jess",
+      prMode: "draft"
+    });
+
+    const failedResponse = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "retry-pending-failed-write"
+        }),
+        body: runBody
+      }),
+      env
+    );
+
+    expect(failedResponse.status).toBe(503);
+    const failedPayload = await parseJson(failedResponse);
+    const failedRun = failedPayload.run as Record<string, unknown>;
+    const failedIdempotency = failedPayload.idempotency as Record<string, unknown>;
+    expect(failedRun.status).toBe("queued");
+    expect(failedRun.failureReason).toBe("queue_publish_failed");
+    expect(failedIdempotency.status).toBe("pending");
+
+    const retryResponse = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "retry-pending-failed-write"
+        }),
+        body: runBody
+      }),
+      env
+    );
+
+    expect(retryResponse.status).toBe(202);
+    const retryPayload = await parseJson(retryResponse);
+    const retryIdempotency = retryPayload.idempotency as Record<string, unknown>;
+    expect(retryIdempotency.requeued).toBe(true);
+    expect(queue.messages).toHaveLength(1);
+  });
+
+  it("retries queue publish when queue-failure marker update throws after enqueue error", async () => {
+    const { env, db, queue } = createEnv();
+    await createRepo(env);
+
+    queue.failNextSend = true;
+    db.failNextRunQueueFailureMarkerUpdate = true;
+
+    const runBody = JSON.stringify({
+      repo: { owner: "sociotechnica-org", name: "lifebuild" },
+      issue: { number: 556 },
+      requestor: "jess",
+      prMode: "draft"
+    });
+
+    const failedResponse = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "retry-missing-marker"
+        }),
+        body: runBody
+      }),
+      env
+    );
+
+    expect(failedResponse.status).toBe(503);
+    const failedPayload = await parseJson(failedResponse);
+    const failedRun = failedPayload.run as Record<string, unknown>;
+    const failedIdempotency = failedPayload.idempotency as Record<string, unknown>;
+    expect(failedRun.status).toBe("queued");
+    expect(failedRun.failureReason).toBeNull();
+    expect(failedIdempotency.status).toBe("failed");
+
+    const retryResponse = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "retry-missing-marker"
+        }),
+        body: runBody
+      }),
+      env
+    );
+
+    expect(retryResponse.status).toBe(202);
+    const retryPayload = await parseJson(retryResponse);
+    const retryIdempotency = retryPayload.idempotency as Record<string, unknown>;
+    expect(retryIdempotency.requeued).toBe(true);
+    expect(queue.messages).toHaveLength(1);
   });
 
   it("does not mark queue failure when idempotency success update fails after enqueue", async () => {

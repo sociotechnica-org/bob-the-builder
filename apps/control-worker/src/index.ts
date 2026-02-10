@@ -459,24 +459,23 @@ async function listRuns(env: Env, filters: ListRunsFilters): Promise<RunWithRepo
   return result.results ?? [];
 }
 
-async function setRunQueueFailure(env: Env, runId: string): Promise<void> {
-  const timestamp = nowIso();
+async function setRunQueueFailureMarker(env: Env, runId: string): Promise<void> {
   await env.DB.prepare(
     `UPDATE runs
-     SET status = ?, failure_reason = ?, finished_at = ?
+     SET failure_reason = ?
      WHERE id = ?`
   )
-    .bind("failed", QUEUE_FAILURE_REASON, timestamp, runId)
+    .bind(QUEUE_FAILURE_REASON, runId)
     .run();
 }
 
-async function clearRunQueueFailure(env: Env, runId: string): Promise<void> {
+async function clearRunQueueFailureMarker(env: Env, runId: string): Promise<void> {
   await env.DB.prepare(
     `UPDATE runs
-     SET status = ?, failure_reason = ?, finished_at = ?
+     SET failure_reason = ?
      WHERE id = ?`
   )
-    .bind("queued", null, null, runId)
+    .bind(null, runId)
     .run();
 }
 
@@ -563,6 +562,19 @@ function serializeIdempotency(
   };
 }
 
+function shouldRetryQueuePublish(existingKey: IdempotencyRow, run: RunWithRepoRow): boolean {
+  if (run.status !== "queued") {
+    return false;
+  }
+
+  if (run.failure_reason === QUEUE_FAILURE_REASON) {
+    return existingKey.status === "failed" || existingKey.status === "pending";
+  }
+
+  // Fallback for cases where queue publish failed but queue-failure marker write failed.
+  return existingKey.status === "failed";
+}
+
 async function replayExistingRun(env: Env, key: string, requestHash: string): Promise<Response> {
   const existingKey = await getIdempotencyRow(env, key);
   if (!existingKey) {
@@ -578,25 +590,33 @@ async function replayExistingRun(env: Env, key: string, requestHash: string): Pr
     return serverError("Failed to load run for idempotency key");
   }
 
-  const shouldRetryQueue =
-    existingKey.status === "failed" &&
-    run.status === "failed" &&
-    run.failure_reason === QUEUE_FAILURE_REASON;
-  if (shouldRetryQueue) {
-    try {
-      await setIdempotencyStatus(env, key, "pending");
-    } catch (error) {
-      logEvent("run.idempotency.pending.failed.before_requeue", {
-        runId: run.id,
-        idempotencyKey: key,
-        error: error instanceof Error ? error.message : String(error)
-      });
-      return serverError("Failed to update idempotency status before requeue");
+  if (shouldRetryQueuePublish(existingKey, run)) {
+    if (existingKey.status === "failed") {
+      try {
+        await setIdempotencyStatus(env, key, "pending");
+      } catch (error) {
+        logEvent("run.idempotency.pending.failed.before_requeue", {
+          runId: run.id,
+          idempotencyKey: key,
+          error: error instanceof Error ? error.message : String(error)
+        });
+        return serverError("Failed to update idempotency status before requeue");
+      }
     }
 
     try {
       await enqueueRun(env, run);
     } catch (error) {
+      try {
+        await setRunQueueFailureMarker(env, run.id);
+      } catch (runStatusError) {
+        logEvent("run.queue_failure_marker.failed.after_requeue_enqueue_error", {
+          runId: run.id,
+          idempotencyKey: key,
+          error: runStatusError instanceof Error ? runStatusError.message : String(runStatusError)
+        });
+      }
+
       try {
         await setIdempotencyStatus(env, key, "failed");
       } catch (statusError) {
@@ -615,7 +635,7 @@ async function replayExistingRun(env: Env, key: string, requestHash: string): Pr
       return json(503, {
         error: "Failed to enqueue run",
         run: serializeRun(run),
-        idempotency: serializeIdempotency(key, true, "failed")
+        idempotency: serializeIdempotency(key, true, "failed", false)
       });
     }
 
@@ -632,9 +652,9 @@ async function replayExistingRun(env: Env, key: string, requestHash: string): Pr
     }
 
     try {
-      await clearRunQueueFailure(env, run.id);
+      await clearRunQueueFailureMarker(env, run.id);
     } catch (error) {
-      logEvent("run.clear_queue_failure.failed.after_requeue", {
+      logEvent("run.clear_queue_failure_marker.failed.after_requeue", {
         runId: run.id,
         idempotencyKey: key,
         error: error instanceof Error ? error.message : String(error)
@@ -793,8 +813,29 @@ async function handleCreateRun(request: Request, env: Env): Promise<Response> {
   try {
     await enqueueRun(env, run);
   } catch (error) {
-    await setRunQueueFailure(env, run.id);
-    await setIdempotencyStatus(env, idempotencyKey, "failed");
+    try {
+      await setRunQueueFailureMarker(env, run.id);
+    } catch (runStatusError) {
+      logEvent("run.queue_failure_marker.failed.after_enqueue_error", {
+        runId: run.id,
+        idempotencyKey,
+        error: runStatusError instanceof Error ? runStatusError.message : String(runStatusError)
+      });
+    }
+
+    let idempotencyStatus: IdempotencyStatus = "pending";
+    try {
+      await setIdempotencyStatus(env, idempotencyKey, "failed");
+      idempotencyStatus = "failed";
+    } catch (idempotencyError) {
+      logEvent("run.idempotency.failed.failed.after_enqueue_error", {
+        runId: run.id,
+        idempotencyKey,
+        error:
+          idempotencyError instanceof Error ? idempotencyError.message : String(idempotencyError)
+      });
+    }
+
     logEvent("run.enqueue.failed", {
       runId: run.id,
       idempotencyKey,
@@ -805,7 +846,7 @@ async function handleCreateRun(request: Request, env: Env): Promise<Response> {
     return json(503, {
       error: "Failed to enqueue run",
       run: serializeRun(failedRun ?? run),
-      idempotency: serializeIdempotency(idempotencyKey, false, "failed")
+      idempotency: serializeIdempotency(idempotencyKey, false, idempotencyStatus)
     });
   }
 
