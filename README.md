@@ -65,17 +65,60 @@ PR1 establishes the base monorepo scaffolding and a minimal Cloudflare worker sl
 - `apps/queue-consumer-worker` scaffold for future queue orchestration
 - `apps/web` Vite + React placeholder app
 
+## PR2 Control Plane Status
+
+PR2 adds the first D1-backed control-plane APIs:
+
+- D1 schema/migrations for `repos`, `runs`, `station_executions`, `artifacts`
+- Queue producer wiring from `POST /v1/runs`
+- Idempotent run creation with `Idempotency-Key`
+- New authenticated endpoints:
+  - `POST /v1/repos`
+  - `GET /v1/repos`
+  - `POST /v1/runs`
+  - `GET /v1/runs`
+  - `GET /v1/runs/:id`
+
 ## Getting Started
 
+Brand new local instance:
+
 ```bash
-pnpm install
-pnpm lint-all
-pnpm test
+pnpm setup
+```
+
+Start the full local stack (control worker, queue-consumer worker, and web app):
+
+```bash
+pnpm dev
+```
+
+Default local ports:
+
+- Control worker: `http://127.0.0.1:20287`
+- Queue-consumer worker: `http://127.0.0.1:20288`
+- Web app: `http://127.0.0.1:6673`
+
+Reset local runtime state and rebuild a fresh local instance:
+
+```bash
+pnpm reset
+```
+
+Common quality commands:
+
+```bash
+pnpm lint-all         # lint:fix + format:fix
+pnpm lint:check       # typecheck + lint + format:check (CI-safe)
+pnpm test             # unit + integration
+pnpm test:unit        # unit tests only
+pnpm test:integration # smoke/integration tests only
 ```
 
 Run the control worker locally:
 
 ```bash
+pnpm migrate
 pnpm --filter @bob/control-worker dev
 ```
 
@@ -85,6 +128,13 @@ In another shell, probe endpoints:
 curl -i http://127.0.0.1:8787/healthz
 curl -i http://127.0.0.1:8787/v1/ping
 curl -i -H \"Authorization: Bearer $BOB_PASSWORD\" http://127.0.0.1:8787/v1/ping
+curl -i -H \"Authorization: Bearer $BOB_PASSWORD\" -H \"Content-Type: application/json\" \
+  -d '{"owner":"sociotechnica-org","name":"lifebuild"}' \
+  http://127.0.0.1:8787/v1/repos
+curl -i -H \"Authorization: Bearer $BOB_PASSWORD\" -H \"Content-Type: application/json\" \
+  -H \"Idempotency-Key: run-123\" \
+  -d '{"repo":{"owner":"sociotechnica-org","name":"lifebuild"},"issue":{"number":123},"requestor":"jess","prMode":"draft"}' \
+  http://127.0.0.1:8787/v1/runs
 ```
 
 Run an automated local Vitest integration smoke test for the control worker:
