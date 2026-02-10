@@ -67,6 +67,8 @@ class MockD1Database {
   private readonly runs: RunRow[] = [];
   private readonly stationExecutions: StationExecutionRow[] = [];
   private readonly artifacts: ArtifactRow[] = [];
+  private failNextArtifactInsert = false;
+  private failNextFailedRunStatusUpdate = false;
 
   public prepare(sql: string): D1PreparedStatement {
     return new MockD1PreparedStatement(this, normalizeSql(sql)) as unknown as D1PreparedStatement;
@@ -88,8 +90,19 @@ class MockD1Database {
     return this.artifacts.filter((row) => row.run_id === runId);
   }
 
+  public failOnNextArtifactInsert(): void {
+    this.failNextArtifactInsert = true;
+  }
+
+  public failOnNextFailedRunStatusUpdate(): void {
+    this.failNextFailedRunStatusUpdate = true;
+  }
+
   public first(sql: string, params: unknown[]): unknown {
-    if (sql.includes("select id, goal from runs") && sql.includes("where id = ?")) {
+    if (
+      sql.includes("select id, goal, status, current_station from runs") &&
+      sql.includes("where id = ?")
+    ) {
       const runId = asString(params[0]);
       const run = this.runs.find((candidate) => candidate.id === runId);
       if (!run) {
@@ -98,7 +111,9 @@ class MockD1Database {
 
       return {
         id: run.id,
-        goal: run.goal
+        goal: run.goal,
+        status: run.status,
+        current_station: run.current_station
       };
     }
 
@@ -186,12 +201,20 @@ class MockD1Database {
       sql.startsWith("update runs") &&
       sql.includes("set status = ?") &&
       sql.includes("finished_at = ?") &&
-      sql.includes("failure_reason = ?")
+      sql.includes("failure_reason = ?") &&
+      sql.includes("where id = ? and status = ?")
     ) {
       const runId = asString(params[4]);
+      const expectedStatus = asString(params[5]);
       const run = this.runs.find((candidate) => candidate.id === runId);
-      if (!run) {
+      if (!run || run.status !== expectedStatus) {
         return 0;
+      }
+
+      const nextStatus = asString(params[0]);
+      if (nextStatus === "failed" && this.failNextFailedRunStatusUpdate) {
+        this.failNextFailedRunStatusUpdate = false;
+        throw new Error("Simulated failed run status update error");
       }
 
       run.status = asString(params[0]);
@@ -202,8 +225,19 @@ class MockD1Database {
     }
 
     if (sql.startsWith("insert into artifacts")) {
+      if (this.failNextArtifactInsert) {
+        this.failNextArtifactInsert = false;
+        throw new Error("Simulated artifact insert error");
+      }
+
+      const artifactId = asString(params[0]);
+      const existing = this.artifacts.find((artifact) => artifact.id === artifactId);
+      if (existing) {
+        return 0;
+      }
+
       this.artifacts.push({
-        id: asString(params[0]),
+        id: artifactId,
         run_id: asString(params[1]),
         type: asString(params[2]),
         storage: asString(params[3]),
@@ -354,7 +388,7 @@ describe("queue-consumer worker", () => {
     expect(artifacts[0]?.type).toBe("workflow_summary");
   });
 
-  it("does not reprocess runs that are already claimed", async () => {
+  it("replays running runs when queue messages are redelivered", async () => {
     const { env, db } = createEnv();
     db.seedRun({
       id: "run_duplicate",
@@ -383,9 +417,9 @@ describe("queue-consumer worker", () => {
     );
 
     expect(message.acked).toBe(true);
-    expect(db.listStations("run_duplicate")).toHaveLength(0);
-    expect(db.listArtifacts("run_duplicate")).toHaveLength(0);
-    expect(db.getRun("run_duplicate")?.status).toBe("running");
+    expect(db.getRun("run_duplicate")?.status).toBe("succeeded");
+    expect(db.listStations("run_duplicate")).toHaveLength(5);
+    expect(db.listArtifacts("run_duplicate")).toHaveLength(1);
   });
 
   it("marks runs failed when a station is forced to fail", async () => {
@@ -428,5 +462,77 @@ describe("queue-consumer worker", () => {
 
     const createPrStation = stations.find((station) => station.station === "create_pr");
     expect(createPrStation).toBeUndefined();
+  });
+
+  it("marks unexpected failures at the current station instead of forcing intake", async () => {
+    const { env, db } = createEnv();
+    db.seedRun({
+      id: "run_unexpected_failure",
+      goal: null,
+      status: "queued",
+      current_station: null,
+      started_at: null,
+      finished_at: null,
+      failure_reason: null
+    });
+    db.failOnNextArtifactInsert();
+
+    const message = createMessage("msg_unexpected_failure", {
+      runId: "run_unexpected_failure",
+      repoId: "repo_1",
+      issueNumber: 126,
+      requestedAt: new Date().toISOString(),
+      requestor: "jess",
+      prMode: "draft"
+    });
+
+    await handleQueue(
+      {
+        messages: [message as unknown as Message<unknown>]
+      } as MessageBatch<unknown>,
+      env
+    );
+
+    const run = db.getRun("run_unexpected_failure");
+    expect(message.acked).toBe(true);
+    expect(message.retries).toBe(0);
+    expect(run?.status).toBe("failed");
+    expect(run?.current_station).toBe("create_pr");
+    expect(run?.failure_reason).toContain("Workflow execution error");
+  });
+
+  it("retries queue delivery when failed status cannot be persisted", async () => {
+    const { env, db } = createEnv();
+    db.seedRun({
+      id: "run_failed_persist_retry",
+      goal: null,
+      status: "queued",
+      current_station: null,
+      started_at: null,
+      finished_at: null,
+      failure_reason: null
+    });
+    db.failOnNextArtifactInsert();
+    db.failOnNextFailedRunStatusUpdate();
+
+    const message = createMessage("msg_failed_persist_retry", {
+      runId: "run_failed_persist_retry",
+      repoId: "repo_1",
+      issueNumber: 127,
+      requestedAt: new Date().toISOString(),
+      requestor: "jess",
+      prMode: "draft"
+    });
+
+    await handleQueue(
+      {
+        messages: [message as unknown as Message<unknown>]
+      } as MessageBatch<unknown>,
+      env
+    );
+
+    expect(message.acked).toBe(false);
+    expect(message.retries).toBe(1);
+    expect(db.getRun("run_failed_persist_retry")?.status).toBe("running");
   });
 });

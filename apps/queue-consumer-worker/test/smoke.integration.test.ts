@@ -85,7 +85,10 @@ class MockD1Database {
   }
 
   public first(sql: string, params: unknown[]): unknown {
-    if (sql.includes("select id, goal from runs") && sql.includes("where id = ?")) {
+    if (
+      sql.includes("select id, goal, status, current_station from runs") &&
+      sql.includes("where id = ?")
+    ) {
       const runId = asString(params[0]);
       const run = this.runs.find((candidate) => candidate.id === runId);
       if (!run) {
@@ -94,7 +97,9 @@ class MockD1Database {
 
       return {
         id: run.id,
-        goal: run.goal
+        goal: run.goal,
+        status: run.status,
+        current_station: run.current_station
       };
     }
 
@@ -173,11 +178,13 @@ class MockD1Database {
     if (
       sql.startsWith("update runs") &&
       sql.includes("set status = ?") &&
-      sql.includes("finished_at = ?")
+      sql.includes("finished_at = ?") &&
+      sql.includes("where id = ? and status = ?")
     ) {
       const runId = asString(params[4]);
+      const expectedStatus = asString(params[5]);
       const run = this.runs.find((candidate) => candidate.id === runId);
-      if (!run) {
+      if (!run || run.status !== expectedStatus) {
         return 0;
       }
 

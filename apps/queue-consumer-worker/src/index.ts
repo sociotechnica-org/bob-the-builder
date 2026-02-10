@@ -12,6 +12,8 @@ export interface Env {
 interface RunExecutionRow {
   id: string;
   goal: string | null;
+  status: string;
+  current_station: string | null;
 }
 
 function json(status: number, body: Record<string, unknown>): Response {
@@ -37,6 +39,18 @@ function logEvent(event: string, payload: Record<string, unknown> = {}): void {
       ...payload
     })
   );
+}
+
+function asStationName(value: string | null): StationName | null {
+  if (!value) {
+    return null;
+  }
+
+  return STATION_NAMES.find((station) => station === value) ?? null;
+}
+
+function isTerminalRunStatus(status: string): boolean {
+  return status === "succeeded" || status === "failed" || status === "canceled";
 }
 
 function parseForcedFailureStation(goal: string | null): StationName | null {
@@ -73,7 +87,7 @@ async function claimQueuedRun(env: Env, runId: string): Promise<boolean> {
 async function getRunForExecution(env: Env, runId: string): Promise<RunExecutionRow | null> {
   return (
     (await env.DB.prepare(
-      `SELECT id, goal
+      `SELECT id, goal, status, current_station
        FROM runs
        WHERE id = ?
        LIMIT 1`
@@ -174,14 +188,16 @@ async function markStationFailed(
     .run();
 }
 
-async function markRunSucceeded(env: Env, runId: string): Promise<void> {
-  await env.DB.prepare(
+async function markRunSucceeded(env: Env, runId: string): Promise<boolean> {
+  const result = await env.DB.prepare(
     `UPDATE runs
      SET status = ?, finished_at = ?, current_station = ?, failure_reason = ?
-     WHERE id = ?`
+     WHERE id = ? AND status = ?`
   )
-    .bind("succeeded", nowIso(), null, null, runId)
+    .bind("succeeded", nowIso(), null, null, runId, "running")
     .run();
+
+  return getAffectedRowCount(result) === 1;
 }
 
 async function markRunFailed(
@@ -189,23 +205,27 @@ async function markRunFailed(
   runId: string,
   station: StationName,
   reason: string
-): Promise<void> {
-  await env.DB.prepare(
+): Promise<boolean> {
+  const result = await env.DB.prepare(
     `UPDATE runs
      SET status = ?, finished_at = ?, current_station = ?, failure_reason = ?
-     WHERE id = ?`
+     WHERE id = ? AND status = ?`
   )
-    .bind("failed", nowIso(), station, reason.slice(0, 500), runId)
+    .bind("failed", nowIso(), station, reason.slice(0, 500), runId, "running")
     .run();
+
+  return getAffectedRowCount(result) === 1;
 }
 
 async function createCompletionArtifact(env: Env, runId: string): Promise<void> {
+  const artifactId = `artifact_${runId}_workflow_summary`;
   await env.DB.prepare(
     `INSERT INTO artifacts (id, run_id, type, storage, payload, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO NOTHING`
   )
     .bind(
-      `artifact_${crypto.randomUUID()}`,
+      artifactId,
       runId,
       "workflow_summary",
       "inline",
@@ -259,9 +279,16 @@ async function runWorkflowSkeleton(env: Env, run: RunExecutionRow): Promise<void
     }
   }
 
-  await markRunSucceeded(env, run.id);
   await createCompletionArtifact(env, run.id);
-  logEvent("run.succeeded", { runId: run.id });
+  const markedSucceeded = await markRunSucceeded(env, run.id);
+  if (markedSucceeded) {
+    logEvent("run.succeeded", { runId: run.id });
+    return;
+  }
+
+  logEvent("run.succeeded.noop", {
+    runId: run.id
+  });
 }
 
 async function processQueueMessage(env: Env, message: Message<unknown>): Promise<void> {
@@ -281,22 +308,71 @@ async function processQueueMessage(env: Env, message: Message<unknown>): Promise
     return;
   }
 
-  const claimed = await claimQueuedRun(env, payload.runId);
-  if (!claimed) {
-    logEvent("run.claim.duplicate", { runId: payload.runId, messageId: message.id });
+  if (isTerminalRunStatus(run.status)) {
+    logEvent("run.skip.terminal", {
+      runId: payload.runId,
+      messageId: message.id,
+      status: run.status
+    });
     message.ack();
     return;
   }
 
-  logEvent("run.claimed", { runId: payload.runId, messageId: message.id });
+  if (run.status === "queued") {
+    const claimed = await claimQueuedRun(env, payload.runId);
+    if (!claimed) {
+      const latestRun = await getRunForExecution(env, payload.runId);
+      if (latestRun && isTerminalRunStatus(latestRun.status)) {
+        logEvent("run.claim.contended.terminal", {
+          runId: payload.runId,
+          messageId: message.id,
+          status: latestRun.status
+        });
+        message.ack();
+        return;
+      }
+
+      logEvent("run.claim.contended.retry", {
+        runId: payload.runId,
+        messageId: message.id
+      });
+      message.retry();
+      return;
+    }
+
+    logEvent("run.claimed", { runId: payload.runId, messageId: message.id });
+  } else if (run.status === "running") {
+    logEvent("run.resume", {
+      runId: payload.runId,
+      messageId: message.id
+    });
+  } else {
+    logEvent("run.skip.unexpected_status", {
+      runId: payload.runId,
+      messageId: message.id,
+      status: run.status
+    });
+    message.ack();
+    return;
+  }
 
   try {
     await runWorkflowSkeleton(env, run);
     message.ack();
   } catch (error) {
     const reason = `Workflow execution error: ${errorMessage(error)}`.slice(0, 500);
+    const latestRun = await getRunForExecution(env, payload.runId);
+    const failureStation = asStationName(latestRun?.current_station ?? null) ?? STATION_NAMES[0];
+    let markedFailed = false;
+
     try {
-      await markRunFailed(env, payload.runId, STATION_NAMES[0], reason);
+      markedFailed = await markRunFailed(env, payload.runId, failureStation, reason);
+      if (!markedFailed) {
+        logEvent("run.failed.mark_skipped", {
+          runId: payload.runId,
+          status: latestRun?.status ?? null
+        });
+      }
     } catch (markError) {
       logEvent("run.failed.mark_error", {
         runId: payload.runId,
@@ -308,7 +384,19 @@ async function processQueueMessage(env: Env, message: Message<unknown>): Promise
       runId: payload.runId,
       error: errorMessage(error)
     });
-    message.ack();
+
+    if (markedFailed) {
+      message.ack();
+      return;
+    }
+
+    const latestRunAfterMark = await getRunForExecution(env, payload.runId);
+    if (!latestRunAfterMark || isTerminalRunStatus(latestRunAfterMark.status)) {
+      message.ack();
+      return;
+    }
+
+    message.retry();
   }
 }
 
