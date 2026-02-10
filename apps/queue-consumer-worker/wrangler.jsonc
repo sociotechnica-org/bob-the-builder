@@ -3,6 +3,21 @@
   "main": "src/index.ts",
   "compatibility_date": "2025-03-07",
   "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "bob-control-worker",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "../control-worker/migrations"
+    }
+  ],
+  "queues": {
+    "consumers": [
+      {
+        "queue": "bob-runs"
+      }
+    ]
+  },
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1

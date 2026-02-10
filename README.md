@@ -79,6 +79,21 @@ PR2 adds the first D1-backed control-plane APIs:
   - `GET /v1/runs`
   - `GET /v1/runs/:id`
 
+## PR3 Execution Orchestration Status
+
+PR3 adds the first asynchronous execution loop:
+
+- `apps/queue-consumer-worker` now consumes run queue messages
+- queue messages are validated and runs are claimed atomically (`queued -> running`)
+- workflow skeleton executes stations in order:
+  - `intake`
+  - `plan`
+  - `implement`
+  - `verify`
+  - `create_pr`
+- run and station execution state are persisted to D1
+- `GET /v1/runs/:id` now returns `run`, `stations`, and artifact summaries
+
 ## Getting Started
 
 Brand new local instance:
@@ -113,6 +128,7 @@ pnpm lint:check       # typecheck + lint + format:check (CI-safe)
 pnpm test             # unit + integration
 pnpm test:unit        # unit tests only
 pnpm test:integration # smoke/integration tests only
+pnpm smoke            # all smoke suites
 ```
 
 Run the control worker locally:
@@ -141,4 +157,10 @@ Run an automated local Vitest integration smoke test for the control worker:
 
 ```bash
 pnpm smoke:control-worker
+```
+
+Run queue-consumer smoke coverage:
+
+```bash
+pnpm smoke:queue-consumer-worker
 ```

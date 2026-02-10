@@ -7,9 +7,13 @@
   "types": "src/index.ts",
   "scripts": {
     "dev": "wrangler dev",
-    "dev:local": "wrangler dev --local --port 20288 --ip 127.0.0.1 --inspector-port 20831",
-    "lint": "eslint src --ext .ts",
+    "dev:local": "wrangler dev --local --port 20288 --ip 127.0.0.1 --inspector-port 20831 --persist-to ../../.wrangler-state",
+    "lint": "eslint src test --ext .ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run --passWithNoTests"
+    "test": "vitest run test/index.test.ts",
+    "test:integration": "vitest run test/smoke.integration.test.ts"
+  },
+  "dependencies": {
+    "@bob/core": "workspace:*"
   }
 }

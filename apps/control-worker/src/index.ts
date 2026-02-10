@@ -51,6 +51,25 @@ interface RunWithRepoRow extends RunRow {
   repo_name: string;
 }
 
+interface StationExecutionRow {
+  id: string;
+  run_id: string;
+  station: string;
+  status: string;
+  started_at: string | null;
+  finished_at: string | null;
+  duration_ms: number | null;
+  summary: string | null;
+}
+
+interface ArtifactSummaryRow {
+  id: string;
+  run_id: string;
+  type: string;
+  storage: string;
+  created_at: string;
+}
+
 interface IdempotencyRow {
   key: string;
   request_hash: string;
@@ -289,6 +308,29 @@ function serializeRun(row: RunWithRepoRow): Record<string, unknown> {
   };
 }
 
+function serializeStationExecution(row: StationExecutionRow): Record<string, unknown> {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    station: row.station,
+    status: row.status,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+    durationMs: row.duration_ms,
+    summary: row.summary
+  };
+}
+
+function serializeArtifactSummary(row: ArtifactSummaryRow): Record<string, unknown> {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    type: row.type,
+    storage: row.storage,
+    createdAt: row.created_at
+  };
+}
+
 function parseRunId(pathname: string): string | null {
   const match = pathname.match(/^\/v1\/runs\/([^/]+)$/);
   if (!match) {
@@ -460,6 +502,48 @@ async function listRuns(env: Env, filters: ListRunsFilters): Promise<RunWithRepo
 
   const statement = env.DB.prepare(query).bind(...binds);
   const result = await statement.all<RunWithRepoRow>();
+  return result.results ?? [];
+}
+
+async function listStationExecutionsByRunId(
+  env: Env,
+  runId: string
+): Promise<StationExecutionRow[]> {
+  const result = await env.DB.prepare(
+    `SELECT id, run_id, station, status, started_at, finished_at, duration_ms, summary
+     FROM station_executions
+     WHERE run_id = ?
+     ORDER BY
+      CASE station
+        WHEN 'intake' THEN 0
+        WHEN 'plan' THEN 1
+        WHEN 'implement' THEN 2
+        WHEN 'verify' THEN 3
+        WHEN 'create_pr' THEN 4
+        ELSE 5
+      END ASC,
+      started_at ASC,
+      id ASC`
+  )
+    .bind(runId)
+    .all<StationExecutionRow>();
+
+  return result.results ?? [];
+}
+
+async function listArtifactSummariesByRunId(
+  env: Env,
+  runId: string
+): Promise<ArtifactSummaryRow[]> {
+  const result = await env.DB.prepare(
+    `SELECT id, run_id, type, storage, created_at
+     FROM artifacts
+     WHERE run_id = ?
+     ORDER BY created_at DESC, id DESC`
+  )
+    .bind(runId)
+    .all<ArtifactSummaryRow>();
+
   return result.results ?? [];
 }
 
@@ -1070,7 +1154,16 @@ async function handleGetRun(runId: string, env: Env): Promise<Response> {
       return routeNotFound();
     }
 
-    return json(200, { run: serializeRun(run) });
+    const [stations, artifacts] = await Promise.all([
+      listStationExecutionsByRunId(env, runId),
+      listArtifactSummariesByRunId(env, runId)
+    ]);
+
+    return json(200, {
+      run: serializeRun(run),
+      stations: stations.map(serializeStationExecution),
+      artifacts: artifacts.map(serializeArtifactSummary)
+    });
   } catch (error) {
     logEvent("run.get.failed", {
       runId,
