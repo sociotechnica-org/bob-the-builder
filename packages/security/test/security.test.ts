@@ -29,6 +29,10 @@ describe("getCookieValue", () => {
   it("returns null when cookie is absent", () => {
     expect(getCookieValue("a=1", "bob_password")).toBeNull();
   });
+
+  it("returns null for malformed percent-encoding", () => {
+    expect(getCookieValue("bob_password=%ZZ", "bob_password")).toBeNull();
+  });
 });
 
 describe("requirePassword", () => {
@@ -60,6 +64,16 @@ describe("requirePassword", () => {
     });
 
     expect(requirePassword(request, env, { allowCookie: true })).toBeNull();
+  });
+
+  it("rejects malformed cookie values without throwing", async () => {
+    const request = new Request("https://example.com/v1/ping", {
+      headers: { cookie: "bob_password=%ZZ" }
+    });
+
+    const response = requirePassword(request, env, { allowCookie: true });
+    expect(response?.status).toBe(401);
+    await expect(response?.json()).resolves.toEqual({ error: "Unauthorized" });
   });
 });
 

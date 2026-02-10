@@ -37,7 +37,15 @@ export function getCookieValue(cookieHeader: string | null, name: string): strin
   }
 
   const value = cookie.slice(name.length + 1);
-  return value ? decodeURIComponent(value) : null;
+  if (!value) {
+    return null;
+  }
+
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
 }
 
 export function unauthorizedResponse(message = "Unauthorized"): Response {

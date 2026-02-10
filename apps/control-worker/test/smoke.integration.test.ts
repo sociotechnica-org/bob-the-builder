@@ -1,17 +1,22 @@
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
+import { createServer } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-const PORT = Number(process.env.BOB_SMOKE_PORT ?? 8788);
+const REQUESTED_PORT = process.env.BOB_SMOKE_PORT ? Number(process.env.BOB_SMOKE_PORT) : undefined;
 const HOST = "127.0.0.1";
-const BASE_URL = `http://${HOST}:${PORT}`;
 const PASSWORD = process.env.BOB_PASSWORD ?? "replace-me";
 const PACKAGE_DIR = fileURLToPath(new URL("..", import.meta.url));
 
 let worker: ChildProcessByStdio<null, Readable, Readable> | undefined;
 let workerStdout = "";
 let workerStderr = "";
+let port = REQUESTED_PORT ?? 0;
+
+function getBaseUrl(): string {
+  return `http://${HOST}:${port}`;
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
@@ -26,7 +31,7 @@ function startWorker(): ChildProcessByStdio<null, Readable, Readable> {
     [
       "dev",
       "--port",
-      String(PORT),
+      String(port),
       "--ip",
       HOST,
       "--local",
@@ -54,8 +59,39 @@ function startWorker(): ChildProcessByStdio<null, Readable, Readable> {
   return child;
 }
 
+async function reserveOpenPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+
+    server.once("error", (error) => {
+      reject(error);
+    });
+
+    server.listen(0, HOST, () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close(() => {
+          reject(new Error("Failed to allocate an ephemeral port"));
+        });
+        return;
+      }
+
+      const reservedPort = address.port;
+      server.close((closeError) => {
+        if (closeError) {
+          reject(closeError);
+          return;
+        }
+
+        resolve(reservedPort);
+      });
+    });
+  });
+}
+
 async function waitForServer(timeoutMs = 20_000): Promise<void> {
   const start = Date.now();
+  const baseUrl = getBaseUrl();
 
   while (Date.now() - start < timeoutMs) {
     if (!worker || worker.exitCode !== null) {
@@ -65,7 +101,7 @@ async function waitForServer(timeoutMs = 20_000): Promise<void> {
     }
 
     try {
-      const response = await fetch(`${BASE_URL}/healthz`);
+      const response = await fetch(`${baseUrl}/healthz`);
       if (response.ok) {
         return;
       }
@@ -76,7 +112,7 @@ async function waitForServer(timeoutMs = 20_000): Promise<void> {
     await sleep(250);
   }
 
-  throw new Error(`Timed out waiting for worker at ${BASE_URL}`);
+  throw new Error(`Timed out waiting for worker at ${baseUrl}`);
 }
 
 async function stopWorker(): Promise<void> {
@@ -108,7 +144,7 @@ async function assertJsonResponse(
   expectedStatus: number,
   expectedBody: Record<string, unknown>
 ): Promise<void> {
-  const response = await fetch(`${BASE_URL}${path}`, init);
+  const response = await fetch(`${getBaseUrl()}${path}`, init);
   const text = await response.text();
 
   expect(response.status).toBe(expectedStatus);
@@ -125,6 +161,10 @@ async function assertJsonResponse(
 
 describe("control worker integration", () => {
   beforeAll(async () => {
+    if (!REQUESTED_PORT) {
+      port = await reserveOpenPort();
+    }
+
     worker = startWorker();
     try {
       await waitForServer();
