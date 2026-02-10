@@ -126,6 +126,7 @@ class MockD1Database {
   public failNextIdempotencyFailedUpdate = false;
   public failNextRunQueueFailureMarkerUpdate = false;
   public failNextIdempotencyInsert = false;
+  public beforeFailedIdempotencyStatusWrite: ((record: IdempotencyRow) => void) | null = null;
 
   public prepare(sql: string): D1PreparedStatement {
     return new MockD1PreparedStatement(this, normalizeSql(sql)) as unknown as D1PreparedStatement;
@@ -317,19 +318,16 @@ class MockD1Database {
     if (sql.startsWith("update run_idempotency_keys")) {
       if (sql.includes("set status = ?, updated_at = ?")) {
         const nextStatus = asString(params[0]) as IdempotencyRow["status"];
-        if (nextStatus === "succeeded" && this.failNextIdempotencySucceededUpdate) {
-          this.failNextIdempotencySucceededUpdate = false;
-          throw new Error("D1_ERROR: failed to update idempotency status");
-        }
-        if (nextStatus === "failed" && this.failNextIdempotencyFailedUpdate) {
-          this.failNextIdempotencyFailedUpdate = false;
-          throw new Error("D1_ERROR: failed to update idempotency status");
-        }
-
         const key = asString(params[2]);
         const record = this.idempotencyKeys.find((candidate) => candidate.key === key);
         if (!record) {
           return 0;
+        }
+
+        if (nextStatus === "failed" && this.beforeFailedIdempotencyStatusWrite) {
+          const hook = this.beforeFailedIdempotencyStatusWrite;
+          this.beforeFailedIdempotencyStatusWrite = null;
+          hook(record);
         }
 
         if (sql.includes("where key = ? and status = ?")) {
@@ -337,6 +335,15 @@ class MockD1Database {
           if (record.status !== expectedStatus) {
             return 0;
           }
+        }
+
+        if (nextStatus === "succeeded" && this.failNextIdempotencySucceededUpdate) {
+          this.failNextIdempotencySucceededUpdate = false;
+          throw new Error("D1_ERROR: failed to update idempotency status");
+        }
+        if (nextStatus === "failed" && this.failNextIdempotencyFailedUpdate) {
+          this.failNextIdempotencyFailedUpdate = false;
+          throw new Error("D1_ERROR: failed to update idempotency status");
         }
 
         record.status = nextStatus;
@@ -1065,6 +1072,62 @@ describe("control worker", () => {
 
     expect(staleReplay.status).toBe(202);
     expect(queue.messages).toHaveLength(1);
+  });
+
+  it("does not overwrite succeeded idempotency status during enqueue-failure race", async () => {
+    const { env, db, queue } = createEnv();
+    await createRepo(env);
+
+    queue.failNextSend = true;
+
+    const runBody = JSON.stringify({
+      repo: { owner: "sociotechnica-org", name: "lifebuild" },
+      issue: { number: 778 },
+      requestor: "jess",
+      prMode: "draft"
+    });
+
+    // Simulate a concurrent replay that already promoted the key to succeeded.
+    db.beforeFailedIdempotencyStatusWrite = (record) => {
+      record.status = "succeeded";
+      record.updated_at = new Date().toISOString();
+    };
+
+    const failedResponse = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "race-no-overwrite"
+        }),
+        body: runBody
+      }),
+      env
+    );
+
+    expect(failedResponse.status).toBe(503);
+    const failedPayload = await parseJson(failedResponse);
+    const failedIdempotency = failedPayload.idempotency as Record<string, unknown>;
+    expect(failedIdempotency.status).toBe("succeeded");
+
+    const replay = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "race-no-overwrite"
+        }),
+        body: runBody
+      }),
+      env
+    );
+
+    expect(replay.status).toBe(200);
+    const replayPayload = await parseJson(replay);
+    const replayIdempotency = replayPayload.idempotency as Record<string, unknown>;
+    expect(replayIdempotency.status).toBe("succeeded");
+    expect(replayIdempotency.requeued).toBe(false);
+    expect(queue.messages).toHaveLength(0);
   });
 
   it("does not enqueue twice when requeue metadata update fails after successful send", async () => {

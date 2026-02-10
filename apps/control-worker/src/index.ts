@@ -527,14 +527,16 @@ async function setIdempotencyStatus(
   env: Env,
   key: string,
   status: IdempotencyStatus
-): Promise<void> {
-  await env.DB.prepare(
+): Promise<boolean> {
+  const result = await env.DB.prepare(
     `UPDATE run_idempotency_keys
      SET status = ?, updated_at = ?
-     WHERE key = ?`
+     WHERE key = ? AND status = ?`
   )
-    .bind(status, nowIso(), key)
+    .bind(status, nowIso(), key, "pending")
     .run();
+
+  return getAffectedRowCount(result) === 1;
 }
 
 async function setRunQueueFailureMarkerSafely(
@@ -579,8 +581,7 @@ async function setIdempotencyStatusSafely(
   event: string
 ): Promise<boolean> {
   try {
-    await setIdempotencyStatus(env, key, nextStatus);
-    return true;
+    return await setIdempotencyStatus(env, key, nextStatus);
   } catch (error) {
     logEvent(event, {
       runId,
@@ -589,6 +590,15 @@ async function setIdempotencyStatusSafely(
     });
     return false;
   }
+}
+
+async function loadIdempotencyStatus(
+  env: Env,
+  key: string,
+  fallback: IdempotencyStatus
+): Promise<IdempotencyStatus> {
+  const latest = await getIdempotencyRow(env, key);
+  return latest?.status ?? fallback;
 }
 
 interface EnqueueFailureResponseInput {
@@ -617,7 +627,9 @@ async function buildEnqueueFailureResponse(input: EnqueueFailureResponseInput): 
     input.run.id,
     input.idempotencyFailureEvent
   );
-  const idempotencyStatus: IdempotencyStatus = idempotencyUpdated ? "failed" : "pending";
+  const idempotencyStatus = idempotencyUpdated
+    ? ("failed" as const)
+    : await loadIdempotencyStatus(input.env, input.idempotencyKey, "pending");
 
   logEvent(input.enqueueFailureEvent, {
     runId: input.run.id,
@@ -797,7 +809,9 @@ async function replayExistingRun(env: Env, key: string, requestHash: string): Pr
       run.id,
       "run.idempotency.succeeded.failed.after_requeue"
     );
-    const idempotencyStatus: IdempotencyStatus = idempotencySucceeded ? "succeeded" : "pending";
+    const idempotencyStatus = idempotencySucceeded
+      ? ("succeeded" as const)
+      : await loadIdempotencyStatus(env, key, "pending");
 
     await clearRunQueueFailureMarkerSafely(
       env,
@@ -1008,7 +1022,9 @@ async function handleCreateRun(request: Request, env: Env): Promise<Response> {
     run.id,
     "run.idempotency.succeeded.failed.after_enqueue"
   );
-  const idempotencyStatus: IdempotencyStatus = idempotencySucceeded ? "succeeded" : "pending";
+  const idempotencyStatus = idempotencySucceeded
+    ? ("succeeded" as const)
+    : await loadIdempotencyStatus(env, idempotencyKey, "pending");
 
   return json(202, {
     run: serializeRun(run),
