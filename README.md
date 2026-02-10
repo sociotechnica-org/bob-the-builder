@@ -86,3 +86,9 @@ curl -i http://127.0.0.1:8787/healthz
 curl -i http://127.0.0.1:8787/v1/ping
 curl -i -H \"Authorization: Bearer $BOB_PASSWORD\" http://127.0.0.1:8787/v1/ping
 ```
+
+Run an automated local smoke test for the control worker:
+
+```bash
+pnpm smoke:control-worker
+```
