@@ -8,6 +8,7 @@ const IDEMPOTENCY_KEY_HEADER = "idempotency-key";
 const QUEUE_FAILURE_REASON = "queue_publish_failed";
 const DEFAULT_LIST_LIMIT = 50;
 const MAX_LIST_LIMIT = 100;
+const PENDING_RETRY_STALE_MS = 30_000;
 const TEXT_ENCODER = new TextEncoder();
 
 type IdempotencyStatus = "pending" | "succeeded" | "failed";
@@ -533,6 +534,40 @@ async function setIdempotencyStatus(
     .run();
 }
 
+function getAffectedRowCount(result: D1Result<unknown>): number {
+  return typeof result.meta?.changes === "number" ? result.meta.changes : 0;
+}
+
+async function claimRequeueRetry(env: Env, idempotency: IdempotencyRow): Promise<boolean> {
+  const claimedAt = nowIso();
+
+  if (idempotency.status === "failed") {
+    const result = await env.DB.prepare(
+      `UPDATE run_idempotency_keys
+       SET status = ?, updated_at = ?
+       WHERE key = ? AND status = ?`
+    )
+      .bind("pending", claimedAt, idempotency.key, "failed")
+      .run();
+
+    return getAffectedRowCount(result) === 1;
+  }
+
+  if (idempotency.status === "pending") {
+    const result = await env.DB.prepare(
+      `UPDATE run_idempotency_keys
+       SET updated_at = ?
+       WHERE key = ? AND status = ? AND updated_at = ?`
+    )
+      .bind(claimedAt, idempotency.key, "pending", idempotency.updated_at)
+      .run();
+
+    return getAffectedRowCount(result) === 1;
+  }
+
+  return false;
+}
+
 function buildQueueMessage(run: RunWithRepoRow): RunQueueMessage {
   return {
     runId: run.id,
@@ -562,17 +597,34 @@ function serializeIdempotency(
   };
 }
 
+function isStalePendingIdempotency(updatedAt: string): boolean {
+  const updatedAtMs = Date.parse(updatedAt);
+  if (Number.isNaN(updatedAtMs)) {
+    return true;
+  }
+
+  return Date.now() - updatedAtMs >= PENDING_RETRY_STALE_MS;
+}
+
 function shouldRetryQueuePublish(existingKey: IdempotencyRow, run: RunWithRepoRow): boolean {
   if (run.status !== "queued") {
     return false;
   }
 
-  if (run.failure_reason === QUEUE_FAILURE_REASON) {
-    return existingKey.status === "failed" || existingKey.status === "pending";
+  if (existingKey.status === "failed") {
+    return true;
   }
 
-  // Fallback for cases where queue publish failed but queue-failure marker write failed.
-  return existingKey.status === "failed";
+  if (existingKey.status !== "pending") {
+    return false;
+  }
+
+  if (run.failure_reason === QUEUE_FAILURE_REASON) {
+    return true;
+  }
+
+  // Recovery path when both queue-failure marker and idempotency-failed updates missed.
+  return isStalePendingIdempotency(existingKey.updated_at);
 }
 
 async function replayExistingRun(env: Env, key: string, requestHash: string): Promise<Response> {
@@ -591,17 +643,30 @@ async function replayExistingRun(env: Env, key: string, requestHash: string): Pr
   }
 
   if (shouldRetryQueuePublish(existingKey, run)) {
-    if (existingKey.status === "failed") {
-      try {
-        await setIdempotencyStatus(env, key, "pending");
-      } catch (error) {
-        logEvent("run.idempotency.pending.failed.before_requeue", {
-          runId: run.id,
-          idempotencyKey: key,
-          error: error instanceof Error ? error.message : String(error)
-        });
-        return serverError("Failed to update idempotency status before requeue");
+    let claimed = false;
+    try {
+      claimed = await claimRequeueRetry(env, existingKey);
+    } catch (error) {
+      logEvent("run.idempotency.requeue_claim.failed", {
+        runId: run.id,
+        idempotencyKey: key,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return serverError("Failed to claim idempotency key before requeue");
+    }
+
+    if (!claimed) {
+      const latestKey = await getIdempotencyRow(env, key);
+      const latestRun = await getRunById(env, run.id);
+      if (!latestKey || !latestRun) {
+        return serverError("Failed to reload run after requeue claim conflict");
       }
+
+      const statusCode = latestKey.status === "succeeded" ? 200 : 202;
+      return json(statusCode, {
+        run: serializeRun(latestRun),
+        idempotency: serializeIdempotency(key, true, latestKey.status)
+      });
     }
 
     try {
@@ -617,8 +682,10 @@ async function replayExistingRun(env: Env, key: string, requestHash: string): Pr
         });
       }
 
+      let idempotencyStatus: IdempotencyStatus = "pending";
       try {
         await setIdempotencyStatus(env, key, "failed");
+        idempotencyStatus = "failed";
       } catch (statusError) {
         logEvent("run.idempotency.failed.failed.after_requeue", {
           runId: run.id,
@@ -632,10 +699,12 @@ async function replayExistingRun(env: Env, key: string, requestHash: string): Pr
         idempotencyKey: key,
         error: error instanceof Error ? error.message : String(error)
       });
+
+      const failedRun = await getRunById(env, run.id);
       return json(503, {
         error: "Failed to enqueue run",
-        run: serializeRun(run),
-        idempotency: serializeIdempotency(key, true, "failed", false)
+        run: serializeRun(failedRun ?? run),
+        idempotency: serializeIdempotency(key, true, idempotencyStatus, false)
       });
     }
 
@@ -804,9 +873,41 @@ async function handleCreateRun(request: Request, env: Env): Promise<Response> {
     return serverError("Failed to create run");
   }
 
-  const claimed = await claimIdempotencyKey(env, idempotencyKey, requestHash, runId);
+  let claimed = false;
+  try {
+    claimed = await claimIdempotencyKey(env, idempotencyKey, requestHash, runId);
+  } catch (error) {
+    logEvent("run.idempotency.claim.failed", {
+      runId: run.id,
+      idempotencyKey,
+      error: error instanceof Error ? error.message : String(error)
+    });
+
+    try {
+      await deleteRun(env, run.id);
+    } catch (deleteError) {
+      logEvent("run.delete.failed.after_idempotency_claim_error", {
+        runId: run.id,
+        idempotencyKey,
+        error: deleteError instanceof Error ? deleteError.message : String(deleteError)
+      });
+      return serverError("Failed to clean up run after idempotency claim failure");
+    }
+
+    return serverError("Failed to claim idempotency key");
+  }
+
   if (!claimed) {
-    await deleteRun(env, run.id);
+    try {
+      await deleteRun(env, run.id);
+    } catch (deleteError) {
+      logEvent("run.delete.failed.after_idempotency_conflict", {
+        runId: run.id,
+        idempotencyKey,
+        error: deleteError instanceof Error ? deleteError.message : String(deleteError)
+      });
+      return serverError("Failed to clean up run after idempotency conflict");
+    }
     return replayExistingRun(env, idempotencyKey, requestHash);
   }
 

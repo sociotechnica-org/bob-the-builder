@@ -43,13 +43,42 @@ interface IdempotencyRow {
 class MockQueue {
   public messages: RunQueueMessage[] = [];
   public failNextSend = false;
+  public holdNextSend = false;
+  private heldSendResolver: (() => void) | null = null;
+  private heldSendReadyResolver: (() => void) | null = null;
 
   public async send(message: RunQueueMessage): Promise<void> {
     if (this.failNextSend) {
       this.failNextSend = false;
       throw new Error("Queue unavailable");
     }
+
+    if (this.holdNextSend) {
+      this.holdNextSend = false;
+      await new Promise<void>((resolve) => {
+        this.heldSendResolver = resolve;
+        this.heldSendReadyResolver?.();
+        this.heldSendReadyResolver = null;
+      });
+      this.heldSendResolver = null;
+    }
+
     this.messages.push(message);
+  }
+
+  public releaseHeldSend(): void {
+    this.heldSendResolver?.();
+    this.heldSendResolver = null;
+  }
+
+  public async waitUntilSendIsHeld(): Promise<void> {
+    if (this.heldSendResolver) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      this.heldSendReadyResolver = resolve;
+    });
   }
 }
 
@@ -73,8 +102,19 @@ class MockD1PreparedStatement {
   }
 
   public async run(): Promise<D1Result<never>> {
-    this.db.run(this.sql, this.params);
-    return { success: true } as D1Result<never>;
+    const changes = this.db.run(this.sql, this.params);
+    return {
+      success: true,
+      meta: {
+        changes,
+        duration: 0,
+        last_row_id: 0,
+        rows_read: 0,
+        rows_written: changes,
+        size_after: 0,
+        changed_db: false
+      } as D1Result<never>["meta"]
+    } as D1Result<never>;
   }
 }
 
@@ -85,6 +125,7 @@ class MockD1Database {
   public failNextIdempotencySucceededUpdate = false;
   public failNextIdempotencyFailedUpdate = false;
   public failNextRunQueueFailureMarkerUpdate = false;
+  public failNextIdempotencyInsert = false;
 
   public prepare(sql: string): D1PreparedStatement {
     return new MockD1PreparedStatement(this, normalizeSql(sql)) as unknown as D1PreparedStatement;
@@ -166,7 +207,7 @@ class MockD1Database {
     throw new Error(`Unsupported all SQL: ${sql}`);
   }
 
-  public run(sql: string, params: unknown[]): void {
+  public run(sql: string, params: unknown[]): number {
     if (sql.startsWith("insert into repos")) {
       const owner = asString(params[1]);
       const name = asString(params[2]);
@@ -185,7 +226,7 @@ class MockD1Database {
         created_at: asString(params[6]),
         updated_at: asString(params[7])
       });
-      return;
+      return 1;
     }
 
     if (sql.startsWith("insert into runs")) {
@@ -206,7 +247,7 @@ class MockD1Database {
         finished_at: asNullableString(params[13]),
         failure_reason: asNullableString(params[14])
       });
-      return;
+      return 1;
     }
 
     if (sql.startsWith("update runs")) {
@@ -218,23 +259,23 @@ class MockD1Database {
 
         const run = this.runs.find((row) => row.id === asString(params[1]));
         if (!run) {
-          return;
+          return 0;
         }
 
         run.failure_reason = asNullableString(params[0]);
-        return;
+        return 1;
       }
 
       if (sql.includes("set status = ?, failure_reason = ?, finished_at = ?")) {
         const run = this.runs.find((row) => row.id === asString(params[3]));
         if (!run) {
-          return;
+          return 0;
         }
 
         run.status = asString(params[0]);
         run.failure_reason = asNullableString(params[1]);
         run.finished_at = asNullableString(params[2]);
-        return;
+        return 1;
       }
 
       throw new Error(`Unsupported runs update SQL: ${sql}`);
@@ -245,11 +286,17 @@ class MockD1Database {
       const index = this.runs.findIndex((row) => row.id === runId);
       if (index >= 0) {
         this.runs.splice(index, 1);
+        return 1;
       }
-      return;
+      return 0;
     }
 
     if (sql.startsWith("insert into run_idempotency_keys")) {
+      if (this.failNextIdempotencyInsert) {
+        this.failNextIdempotencyInsert = false;
+        throw new Error("D1_ERROR: transient idempotency insert failure");
+      }
+
       const key = asString(params[0]);
       const existing = this.idempotencyKeys.find((record) => record.key === key);
       if (existing) {
@@ -264,32 +311,69 @@ class MockD1Database {
         created_at: asString(params[4]),
         updated_at: asString(params[5])
       });
-      return;
+      return 1;
     }
 
     if (sql.startsWith("update run_idempotency_keys")) {
-      const nextStatus = asString(params[0]) as IdempotencyRow["status"];
-      if (nextStatus === "succeeded" && this.failNextIdempotencySucceededUpdate) {
-        this.failNextIdempotencySucceededUpdate = false;
-        throw new Error("D1_ERROR: failed to update idempotency status");
-      }
-      if (nextStatus === "failed" && this.failNextIdempotencyFailedUpdate) {
-        this.failNextIdempotencyFailedUpdate = false;
-        throw new Error("D1_ERROR: failed to update idempotency status");
+      if (sql.includes("set status = ?, updated_at = ?")) {
+        const nextStatus = asString(params[0]) as IdempotencyRow["status"];
+        if (nextStatus === "succeeded" && this.failNextIdempotencySucceededUpdate) {
+          this.failNextIdempotencySucceededUpdate = false;
+          throw new Error("D1_ERROR: failed to update idempotency status");
+        }
+        if (nextStatus === "failed" && this.failNextIdempotencyFailedUpdate) {
+          this.failNextIdempotencyFailedUpdate = false;
+          throw new Error("D1_ERROR: failed to update idempotency status");
+        }
+
+        const key = asString(params[2]);
+        const record = this.idempotencyKeys.find((candidate) => candidate.key === key);
+        if (!record) {
+          return 0;
+        }
+
+        if (sql.includes("where key = ? and status = ?")) {
+          const expectedStatus = asString(params[3]) as IdempotencyRow["status"];
+          if (record.status !== expectedStatus) {
+            return 0;
+          }
+        }
+
+        record.status = nextStatus;
+        record.updated_at = asString(params[1]);
+        return 1;
       }
 
-      const key = asString(params[2]);
-      const record = this.idempotencyKeys.find((candidate) => candidate.key === key);
-      if (!record) {
-        return;
+      if (sql.includes("set updated_at = ?")) {
+        const key = asString(params[1]);
+        const expectedStatus = asString(params[2]) as IdempotencyRow["status"];
+        const expectedUpdatedAt = asString(params[3]);
+        const record = this.idempotencyKeys.find((candidate) => candidate.key === key);
+        if (!record) {
+          return 0;
+        }
+
+        if (record.status !== expectedStatus || record.updated_at !== expectedUpdatedAt) {
+          return 0;
+        }
+
+        record.updated_at = asString(params[0]);
+        return 1;
       }
 
-      record.status = nextStatus;
-      record.updated_at = asString(params[1]);
-      return;
+      throw new Error(`Unsupported run_idempotency_keys update SQL: ${sql}`);
     }
 
     throw new Error(`Unsupported run SQL: ${sql}`);
+  }
+
+  public rewindIdempotencyUpdatedAt(key: string, offsetMs: number): void {
+    const record = this.idempotencyKeys.find((candidate) => candidate.key === key);
+    if (!record) {
+      throw new Error(`Idempotency record ${key} not found`);
+    }
+
+    record.updated_at = new Date(Date.now() - offsetMs).toISOString();
   }
 
   private withRepo(run: RunRow): Record<string, unknown> {
@@ -523,6 +607,62 @@ describe("control worker", () => {
     expect(runResponse.status).toBe(200);
   });
 
+  it("cleans up created run when idempotency key claim throws", async () => {
+    const { env, db, queue } = createEnv();
+    await createRepo(env);
+
+    db.failNextIdempotencyInsert = true;
+
+    const runBody = JSON.stringify({
+      repo: { owner: "sociotechnica-org", name: "lifebuild" },
+      issue: { number: 130 },
+      requestor: "jess",
+      prMode: "draft"
+    });
+
+    const firstResponse = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "claim-failure-key"
+        }),
+        body: runBody
+      }),
+      env
+    );
+
+    expect(firstResponse.status).toBe(500);
+    expect(queue.messages).toHaveLength(0);
+
+    const secondResponse = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "claim-failure-key"
+        }),
+        body: runBody
+      }),
+      env
+    );
+
+    expect(secondResponse.status).toBe(202);
+    expect(queue.messages).toHaveLength(1);
+
+    const listResponse = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        headers: authHeaders()
+      }),
+      env
+    );
+
+    expect(listResponse.status).toBe(200);
+    const listPayload = await parseJson(listResponse);
+    const runs = listPayload.runs as Array<Record<string, unknown>>;
+    expect(runs).toHaveLength(1);
+  });
+
   it("rejects idempotency key reuse with a different payload", async () => {
     const { env } = createEnv();
     await createRepo(env);
@@ -719,6 +859,145 @@ describe("control worker", () => {
     const retryIdempotency = retryPayload.idempotency as Record<string, unknown>;
     expect(retryIdempotency.requeued).toBe(true);
     expect(queue.messages).toHaveLength(1);
+  });
+
+  it("recovers stale pending idempotency when both queue-failure writes fail", async () => {
+    const { env, db, queue } = createEnv();
+    await createRepo(env);
+
+    queue.failNextSend = true;
+    db.failNextRunQueueFailureMarkerUpdate = true;
+    db.failNextIdempotencyFailedUpdate = true;
+
+    const runBody = JSON.stringify({
+      repo: { owner: "sociotechnica-org", name: "lifebuild" },
+      issue: { number: 557 },
+      requestor: "jess",
+      prMode: "draft"
+    });
+
+    const failedResponse = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "retry-stale-pending"
+        }),
+        body: runBody
+      }),
+      env
+    );
+
+    expect(failedResponse.status).toBe(503);
+    const failedPayload = await parseJson(failedResponse);
+    const failedRun = failedPayload.run as Record<string, unknown>;
+    const failedIdempotency = failedPayload.idempotency as Record<string, unknown>;
+    expect(failedRun.failureReason).toBeNull();
+    expect(failedIdempotency.status).toBe("pending");
+    expect(queue.messages).toHaveLength(0);
+
+    // Pending-without-marker should not immediately requeue, but it should recover once stale.
+    const immediateReplay = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "retry-stale-pending"
+        }),
+        body: runBody
+      }),
+      env
+    );
+    expect(immediateReplay.status).toBe(202);
+    expect(queue.messages).toHaveLength(0);
+
+    db.rewindIdempotencyUpdatedAt("retry-stale-pending", 31_000);
+
+    const staleReplay = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "retry-stale-pending"
+        }),
+        body: runBody
+      }),
+      env
+    );
+
+    expect(staleReplay.status).toBe(202);
+    const stalePayload = await parseJson(staleReplay);
+    const staleIdempotency = stalePayload.idempotency as Record<string, unknown>;
+    expect(staleIdempotency.requeued).toBe(true);
+    expect(queue.messages).toHaveLength(1);
+  });
+
+  it("claims requeue atomically so concurrent retries enqueue only once", async () => {
+    const { env, queue } = createEnv();
+    await createRepo(env);
+
+    queue.failNextSend = true;
+
+    const runBody = JSON.stringify({
+      repo: { owner: "sociotechnica-org", name: "lifebuild" },
+      issue: { number: 558 },
+      requestor: "jess",
+      prMode: "draft"
+    });
+
+    const failedCreate = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "retry-race"
+        }),
+        body: runBody
+      }),
+      env
+    );
+    expect(failedCreate.status).toBe(503);
+
+    queue.holdNextSend = true;
+    const retryOnePromise = handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "retry-race"
+        }),
+        body: runBody
+      }),
+      env
+    );
+
+    await queue.waitUntilSendIsHeld();
+
+    const retryTwoPromise = handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "retry-race"
+        }),
+        body: runBody
+      }),
+      env
+    );
+
+    queue.releaseHeldSend();
+
+    const [retryOne, retryTwo] = await Promise.all([retryOnePromise, retryTwoPromise]);
+    expect(retryOne.status).toBe(202);
+    expect(retryTwo.status).toBeGreaterThanOrEqual(200);
+    expect(queue.messages).toHaveLength(1);
+
+    const payloads = await Promise.all([parseJson(retryOne), parseJson(retryTwo)]);
+    const requeueCount = payloads.filter((payload) => {
+      const idempotency = payload.idempotency as Record<string, unknown>;
+      return idempotency.requeued === true;
+    }).length;
+    expect(requeueCount).toBe(1);
   });
 
   it("does not mark queue failure when idempotency success update fails after enqueue", async () => {
