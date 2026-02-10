@@ -9,7 +9,8 @@
     "dev": "wrangler dev",
     "lint": "eslint src test --ext .ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:integration": "vitest run test/smoke.integration.test.ts"
   },
   "dependencies": {
     "@bob/security": "workspace:*"
