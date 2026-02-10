@@ -17,21 +17,21 @@ type SubtleCryptoWithTimingSafeEqual = SubtleCrypto & {
 function timingSafeEqualStrings(left: string, right: string): boolean {
   const leftBytes = TEXT_ENCODER.encode(left);
   const rightBytes = TEXT_ENCODER.encode(right);
+  const maxLength = Math.max(leftBytes.length, rightBytes.length);
+  const leftPadded = new Uint8Array(maxLength);
+  const rightPadded = new Uint8Array(maxLength);
+  leftPadded.set(leftBytes);
+  rightPadded.set(rightBytes);
+  let mismatch = leftBytes.length ^ rightBytes.length;
 
   const subtleCrypto = globalThis.crypto?.subtle as SubtleCryptoWithTimingSafeEqual | undefined;
   if (subtleCrypto && typeof subtleCrypto.timingSafeEqual === "function") {
-    if (leftBytes.byteLength !== rightBytes.byteLength) {
-      return false;
-    }
-
-    return subtleCrypto.timingSafeEqual(leftBytes, rightBytes);
+    const bytesEqual = subtleCrypto.timingSafeEqual(leftPadded, rightPadded);
+    return bytesEqual && mismatch === 0;
   }
 
-  const maxLength = Math.max(leftBytes.length, rightBytes.length);
-  let mismatch = leftBytes.length ^ rightBytes.length;
-
   for (let index = 0; index < maxLength; index += 1) {
-    mismatch |= (leftBytes[index] ?? 0) ^ (rightBytes[index] ?? 0);
+    mismatch |= leftPadded[index] ^ rightPadded[index];
   }
 
   return mismatch === 0;

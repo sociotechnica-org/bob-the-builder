@@ -81,6 +81,46 @@ describe("requirePassword", () => {
     expect(response?.status).toBe(401);
     await expect(response?.json()).resolves.toEqual({ error: "Unauthorized" });
   });
+
+  it("pads mismatched lengths before timing-safe compare", () => {
+    const originalCrypto = globalThis.crypto;
+    const calls: Array<{ leftLength: number; rightLength: number }> = [];
+
+    const fakeSubtle = {
+      timingSafeEqual(left: BufferSource, right: BufferSource): boolean {
+        calls.push({
+          leftLength: left.byteLength,
+          rightLength: right.byteLength
+        });
+        return true;
+      }
+    } as unknown as SubtleCrypto;
+
+    const fakeCrypto = { subtle: fakeSubtle } as unknown as Crypto;
+    Object.defineProperty(globalThis, "crypto", {
+      value: fakeCrypto,
+      configurable: true
+    });
+
+    try {
+      const request = new Request("https://example.com/v1/ping", {
+        headers: { authorization: "Bearer x" }
+      });
+
+      const response = requirePassword(request, env);
+      expect(response?.status).toBe(401);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toEqual({
+        leftLength: env.BOB_PASSWORD.length,
+        rightLength: env.BOB_PASSWORD.length
+      });
+    } finally {
+      Object.defineProperty(globalThis, "crypto", {
+        value: originalCrypto,
+        configurable: true
+      });
+    }
+  });
 });
 
 describe("unauthorizedResponse", () => {
