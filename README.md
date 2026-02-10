@@ -69,8 +69,7 @@ PR1 establishes the base monorepo scaffolding and a minimal Cloudflare worker sl
 
 ```bash
 pnpm install
-pnpm lint
-pnpm typecheck
+pnpm lint-all
 pnpm test
 ```
 
