@@ -584,20 +584,29 @@ async function replayExistingRun(env: Env, key: string, requestHash: string): Pr
     run.failure_reason === QUEUE_FAILURE_REASON;
   if (shouldRetryQueue) {
     try {
-      await enqueueRun(env, run);
-      await clearRunQueueFailure(env, run.id);
-      await setIdempotencyStatus(env, key, "succeeded");
+      await setIdempotencyStatus(env, key, "pending");
+    } catch (error) {
+      logEvent("run.idempotency.pending.failed.before_requeue", {
+        runId: run.id,
+        idempotencyKey: key,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return serverError("Failed to update idempotency status before requeue");
+    }
 
-      const refreshedRun = await getRunById(env, run.id);
-      if (!refreshedRun) {
-        return serverError("Failed to reload run after requeue");
+    try {
+      await enqueueRun(env, run);
+    } catch (error) {
+      try {
+        await setIdempotencyStatus(env, key, "failed");
+      } catch (statusError) {
+        logEvent("run.idempotency.failed.failed.after_requeue", {
+          runId: run.id,
+          idempotencyKey: key,
+          error: statusError instanceof Error ? statusError.message : String(statusError)
+        });
       }
 
-      return json(202, {
-        run: serializeRun(refreshedRun),
-        idempotency: serializeIdempotency(key, true, "succeeded", true)
-      });
-    } catch (error) {
       logEvent("run.enqueue.failed.retry", {
         runId: run.id,
         idempotencyKey: key,
@@ -609,6 +618,38 @@ async function replayExistingRun(env: Env, key: string, requestHash: string): Pr
         idempotency: serializeIdempotency(key, true, "failed")
       });
     }
+
+    let idempotencyStatus: IdempotencyStatus = "pending";
+    try {
+      await setIdempotencyStatus(env, key, "succeeded");
+      idempotencyStatus = "succeeded";
+    } catch (error) {
+      logEvent("run.idempotency.succeeded.failed.after_requeue", {
+        runId: run.id,
+        idempotencyKey: key,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+
+    try {
+      await clearRunQueueFailure(env, run.id);
+    } catch (error) {
+      logEvent("run.clear_queue_failure.failed.after_requeue", {
+        runId: run.id,
+        idempotencyKey: key,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+
+    const refreshedRun = await getRunById(env, run.id);
+    if (!refreshedRun) {
+      return serverError("Failed to reload run after requeue");
+    }
+
+    return json(202, {
+      run: serializeRun(refreshedRun),
+      idempotency: serializeIdempotency(key, true, idempotencyStatus, true)
+    });
   }
 
   const statusCode = existingKey.status === "succeeded" ? 200 : 202;
@@ -751,11 +792,6 @@ async function handleCreateRun(request: Request, env: Env): Promise<Response> {
 
   try {
     await enqueueRun(env, run);
-    await setIdempotencyStatus(env, idempotencyKey, "succeeded");
-    return json(202, {
-      run: serializeRun(run),
-      idempotency: serializeIdempotency(idempotencyKey, false, "succeeded")
-    });
   } catch (error) {
     await setRunQueueFailure(env, run.id);
     await setIdempotencyStatus(env, idempotencyKey, "failed");
@@ -772,6 +808,23 @@ async function handleCreateRun(request: Request, env: Env): Promise<Response> {
       idempotency: serializeIdempotency(idempotencyKey, false, "failed")
     });
   }
+
+  let idempotencyStatus: IdempotencyStatus = "pending";
+  try {
+    await setIdempotencyStatus(env, idempotencyKey, "succeeded");
+    idempotencyStatus = "succeeded";
+  } catch (error) {
+    logEvent("run.idempotency.succeeded.failed.after_enqueue", {
+      runId: run.id,
+      idempotencyKey,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+
+  return json(202, {
+    run: serializeRun(run),
+    idempotency: serializeIdempotency(idempotencyKey, false, idempotencyStatus)
+  });
 }
 
 async function handleListRuns(url: URL, env: Env): Promise<Response> {

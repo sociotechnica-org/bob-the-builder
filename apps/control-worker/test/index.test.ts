@@ -82,6 +82,7 @@ class MockD1Database {
   private readonly repos: RepoRow[] = [];
   private readonly runs: RunRow[] = [];
   private readonly idempotencyKeys: IdempotencyRow[] = [];
+  public failNextIdempotencySucceededUpdate = false;
 
   public prepare(sql: string): D1PreparedStatement {
     return new MockD1PreparedStatement(this, normalizeSql(sql)) as unknown as D1PreparedStatement;
@@ -246,13 +247,19 @@ class MockD1Database {
     }
 
     if (sql.startsWith("update run_idempotency_keys")) {
+      const nextStatus = asString(params[0]) as IdempotencyRow["status"];
+      if (nextStatus === "succeeded" && this.failNextIdempotencySucceededUpdate) {
+        this.failNextIdempotencySucceededUpdate = false;
+        throw new Error("D1_ERROR: failed to update idempotency status");
+      }
+
       const key = asString(params[2]);
       const record = this.idempotencyKeys.find((candidate) => candidate.key === key);
       if (!record) {
         return;
       }
 
-      record.status = asString(params[0]) as IdempotencyRow["status"];
+      record.status = nextStatus;
       record.updated_at = asString(params[1]);
       return;
     }
@@ -581,5 +588,123 @@ describe("control worker", () => {
     const retryPayload = await parseJson(retryResponse);
     const idempotency = retryPayload.idempotency as Record<string, unknown>;
     expect(idempotency.requeued).toBe(true);
+  });
+
+  it("does not mark queue failure when idempotency success update fails after enqueue", async () => {
+    const { env, db, queue } = createEnv();
+    await createRepo(env);
+
+    db.failNextIdempotencySucceededUpdate = true;
+
+    const runBody = JSON.stringify({
+      repo: { owner: "sociotechnica-org", name: "lifebuild" },
+      issue: { number: 333 },
+      requestor: "jess",
+      prMode: "draft"
+    });
+
+    const firstResponse = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "pending-key"
+        }),
+        body: runBody
+      }),
+      env
+    );
+
+    expect(firstResponse.status).toBe(202);
+    const firstPayload = await parseJson(firstResponse);
+    const firstRun = firstPayload.run as Record<string, unknown>;
+    const firstIdempotency = firstPayload.idempotency as Record<string, unknown>;
+    expect(firstRun.status).toBe("queued");
+    expect(firstRun.failureReason).toBeNull();
+    expect(firstIdempotency.status).toBe("pending");
+    expect(queue.messages).toHaveLength(1);
+
+    const replayResponse = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "pending-key"
+        }),
+        body: runBody
+      }),
+      env
+    );
+
+    expect(replayResponse.status).toBe(202);
+    const replayPayload = await parseJson(replayResponse);
+    const replayIdempotency = replayPayload.idempotency as Record<string, unknown>;
+    expect(replayIdempotency.replayed).toBe(true);
+    expect(replayIdempotency.status).toBe("pending");
+    expect(queue.messages).toHaveLength(1);
+  });
+
+  it("does not enqueue twice when requeue metadata update fails after successful send", async () => {
+    const { env, db, queue } = createEnv();
+    await createRepo(env);
+
+    queue.failNextSend = true;
+
+    const runBody = JSON.stringify({
+      repo: { owner: "sociotechnica-org", name: "lifebuild" },
+      issue: { number: 444 },
+      requestor: "jess",
+      prMode: "draft"
+    });
+
+    const failedResponse = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "retry-no-dup"
+        }),
+        body: runBody
+      }),
+      env
+    );
+
+    expect(failedResponse.status).toBe(503);
+    expect(queue.messages).toHaveLength(0);
+
+    db.failNextIdempotencySucceededUpdate = true;
+    const retryResponse = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "retry-no-dup"
+        }),
+        body: runBody
+      }),
+      env
+    );
+
+    expect(retryResponse.status).toBe(202);
+    const retryPayload = await parseJson(retryResponse);
+    const retryIdempotency = retryPayload.idempotency as Record<string, unknown>;
+    expect(retryIdempotency.requeued).toBe(true);
+    expect(retryIdempotency.status).toBe("pending");
+    expect(queue.messages).toHaveLength(1);
+
+    const secondRetry = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "retry-no-dup"
+        }),
+        body: runBody
+      }),
+      env
+    );
+
+    expect(secondRetry.status).toBe(202);
+    expect(queue.messages).toHaveLength(1);
   });
 });
