@@ -193,6 +193,21 @@ describe("control worker integration", () => {
     });
   });
 
+  it("returns 401 for /v1/ping with cookie auth", async () => {
+    await assertJsonResponse(
+      "/v1/ping",
+      {
+        headers: {
+          cookie: `bob_password=${PASSWORD}`
+        }
+      },
+      401,
+      {
+        error: "Unauthorized"
+      }
+    );
+  });
+
   it("returns pong for /v1/ping with valid bearer auth", async () => {
     await assertJsonResponse(
       "/v1/ping",

@@ -16,6 +16,19 @@ describe("control worker", () => {
     expect(response.status).toBe(401);
   });
 
+  it("does not accept cookie auth on v1 routes", async () => {
+    const response = await handleRequest(
+      new Request("https://example.com/v1/ping", {
+        headers: {
+          cookie: "bob_password=password123"
+        }
+      }),
+      env
+    );
+
+    expect(response.status).toBe(401);
+  });
+
   it("returns pong for authorized requests", async () => {
     const response = await handleRequest(
       new Request("https://example.com/v1/ping", {

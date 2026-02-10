@@ -49,13 +49,19 @@ describe("requirePassword", () => {
     const invalid = new Request("https://example.com/v1/ping", {
       headers: { authorization: "Bearer wrong" }
     });
+    const invalidSameLength = new Request("https://example.com/v1/ping", {
+      headers: { authorization: "Bearer s3cr3X" }
+    });
 
     const missingResponse = requirePassword(missing, env);
     const invalidResponse = requirePassword(invalid, env);
+    const invalidSameLengthResponse = requirePassword(invalidSameLength, env);
 
     expect(missingResponse?.status).toBe(401);
     expect(invalidResponse?.status).toBe(401);
+    expect(invalidSameLengthResponse?.status).toBe(401);
     await expect(invalidResponse?.json()).resolves.toEqual({ error: "Unauthorized" });
+    await expect(invalidSameLengthResponse?.json()).resolves.toEqual({ error: "Unauthorized" });
   });
 
   it("supports cookie fallback when enabled", () => {

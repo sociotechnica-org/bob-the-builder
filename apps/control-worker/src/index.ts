@@ -30,7 +30,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   }
 
   if (url.pathname.startsWith("/v1/")) {
-    const unauthorized = requirePassword(request, env, { allowCookie: true });
+    const unauthorized = requirePassword(request, env);
     if (unauthorized) {
       return unauthorized;
     }
