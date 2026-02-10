@@ -1,0 +1,11 @@
+node_modules/
+*.log
+dist/
+coverage/
+*.tsbuildinfo
+.playwright/
+.wrangler/
+.dev.vars
+.env
+.env.*
+!.env.example

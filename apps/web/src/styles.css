@@ -1,0 +1,27 @@
+:root {
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  color: #1f2937;
+  background: linear-gradient(145deg, #f9fafb 0%, #ecfeff 100%);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+.app-shell {
+  max-width: 720px;
+  margin: 72px auto;
+  padding: 32px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 18px 50px rgba(15, 23, 42, 0.12);
+}
+
+h1 {
+  margin-top: 0;
+}

@@ -1,0 +1,18 @@
+{
+  "name": "@bob/control-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "lint": "eslint src test --ext .ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run test/index.test.ts",
+    "test:integration": "vitest run test/smoke.integration.test.ts"
+  },
+  "dependencies": {
+    "@bob/security": "workspace:*"
+  }
+}
