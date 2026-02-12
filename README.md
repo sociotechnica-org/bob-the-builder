@@ -1,6 +1,6 @@
-# bob-the-builder
+# chip
 
-`bob-the-builder` is a Cloudflare-first software factory that turns GitHub issues into pull requests.
+`chip` is a Cloudflare-first software factory that turns GitHub issues into pull requests.
 
 ## Intent
 
