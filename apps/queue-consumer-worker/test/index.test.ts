@@ -68,7 +68,7 @@ class MockD1Database {
   private readonly stationExecutions: StationExecutionRow[] = [];
   private readonly artifacts: ArtifactRow[] = [];
   private failNextArtifactInsert = false;
-  private failNextFailedRunStatusUpdate = false;
+  private failedRunStatusUpdatesToFail = 0;
 
   public prepare(sql: string): D1PreparedStatement {
     return new MockD1PreparedStatement(this, normalizeSql(sql)) as unknown as D1PreparedStatement;
@@ -94,8 +94,8 @@ class MockD1Database {
     this.failNextArtifactInsert = true;
   }
 
-  public failOnNextFailedRunStatusUpdate(): void {
-    this.failNextFailedRunStatusUpdate = true;
+  public failOnNextFailedRunStatusUpdate(count = 1): void {
+    this.failedRunStatusUpdatesToFail += Math.max(1, count);
   }
 
   public first(sql: string, params: unknown[]): unknown {
@@ -213,8 +213,8 @@ class MockD1Database {
       }
 
       const nextStatus = asString(params[0]);
-      if (nextStatus === "failed" && this.failNextFailedRunStatusUpdate) {
-        this.failNextFailedRunStatusUpdate = false;
+      if (nextStatus === "failed" && this.failedRunStatusUpdatesToFail > 0) {
+        this.failedRunStatusUpdatesToFail -= 1;
         throw new Error("Simulated failed run status update error");
       }
 
@@ -389,7 +389,7 @@ describe("queue-consumer worker", () => {
     expect(artifacts[0]?.type).toBe("workflow_summary");
   });
 
-  it("replays stale running runs when queue messages are redelivered", async () => {
+  it("retries stale running runs without replaying workflow side effects", async () => {
     const { env, db } = createEnv();
     db.seedRun({
       id: "run_duplicate",
@@ -417,13 +417,14 @@ describe("queue-consumer worker", () => {
       env
     );
 
-    expect(message.acked).toBe(true);
-    expect(db.getRun("run_duplicate")?.status).toBe("succeeded");
-    expect(db.listStations("run_duplicate")).toHaveLength(5);
-    expect(db.listArtifacts("run_duplicate")).toHaveLength(1);
+    expect(message.acked).toBe(false);
+    expect(message.retries).toBe(1);
+    expect(db.getRun("run_duplicate")?.status).toBe("running");
+    expect(db.listStations("run_duplicate")).toHaveLength(0);
+    expect(db.listArtifacts("run_duplicate")).toHaveLength(0);
   });
 
-  it("acks recent running runs to avoid duplicate concurrent execution", async () => {
+  it("retries recent running runs to avoid duplicate concurrent execution", async () => {
     const { env, db } = createEnv();
     db.seedRun({
       id: "run_running_recent",
@@ -451,8 +452,8 @@ describe("queue-consumer worker", () => {
       env
     );
 
-    expect(message.acked).toBe(true);
-    expect(message.retries).toBe(0);
+    expect(message.acked).toBe(false);
+    expect(message.retries).toBe(1);
     expect(db.getRun("run_running_recent")?.status).toBe("running");
     expect(db.listStations("run_running_recent")).toHaveLength(0);
     expect(db.listArtifacts("run_running_recent")).toHaveLength(0);
@@ -500,10 +501,10 @@ describe("queue-consumer worker", () => {
     expect(createPrStation).toBeUndefined();
   });
 
-  it("marks unexpected failures at the current station instead of forcing intake", async () => {
+  it("keeps run succeeded when completion artifact creation fails", async () => {
     const { env, db } = createEnv();
     db.seedRun({
-      id: "run_unexpected_failure",
+      id: "run_artifact_failure",
       goal: null,
       status: "queued",
       current_station: null,
@@ -513,8 +514,8 @@ describe("queue-consumer worker", () => {
     });
     db.failOnNextArtifactInsert();
 
-    const message = createMessage("msg_unexpected_failure", {
-      runId: "run_unexpected_failure",
+    const message = createMessage("msg_artifact_failure", {
+      runId: "run_artifact_failure",
       repoId: "repo_1",
       issueNumber: 126,
       requestedAt: new Date().toISOString(),
@@ -529,27 +530,27 @@ describe("queue-consumer worker", () => {
       env
     );
 
-    const run = db.getRun("run_unexpected_failure");
+    const run = db.getRun("run_artifact_failure");
     expect(message.acked).toBe(true);
     expect(message.retries).toBe(0);
-    expect(run?.status).toBe("failed");
-    expect(run?.current_station).toBe("create_pr");
-    expect(run?.failure_reason).toContain("Workflow execution error");
+    expect(run?.status).toBe("succeeded");
+    expect(run?.current_station).toBeNull();
+    expect(run?.failure_reason).toBeNull();
+    expect(db.listArtifacts("run_artifact_failure")).toHaveLength(0);
   });
 
   it("retries queue delivery when failed status cannot be persisted", async () => {
     const { env, db } = createEnv();
     db.seedRun({
       id: "run_failed_persist_retry",
-      goal: null,
+      goal: "force_fail:verify",
       status: "queued",
       current_station: null,
       started_at: null,
       finished_at: null,
       failure_reason: null
     });
-    db.failOnNextArtifactInsert();
-    db.failOnNextFailedRunStatusUpdate();
+    db.failOnNextFailedRunStatusUpdate(2);
 
     const message = createMessage("msg_failed_persist_retry", {
       runId: "run_failed_persist_retry",

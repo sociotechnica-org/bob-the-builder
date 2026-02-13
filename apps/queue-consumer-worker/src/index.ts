@@ -1,7 +1,10 @@
 import {
   isRunQueueMessage,
+  isRunStatus,
+  isTerminalRunStatus,
   STATION_NAMES,
   type RunQueueMessage,
+  type RunStatus,
   type StationName
 } from "@bob/core";
 
@@ -18,7 +21,6 @@ interface RunExecutionRow {
   started_at: string | null;
 }
 
-const RUN_RESUME_STALE_MS = 30_000;
 const LOCAL_QUEUE_CONSUME_PATH = "/__queue/consume";
 const LOCAL_QUEUE_SECRET_HEADER = "x-bob-local-queue-secret";
 
@@ -55,25 +57,8 @@ function asStationName(value: string | null): StationName | null {
   return STATION_NAMES.find((station) => station === value) ?? null;
 }
 
-function isTerminalRunStatus(status: string): boolean {
-  return status === "succeeded" || status === "failed" || status === "canceled";
-}
-
-function shouldResumeRunningRun(run: RunExecutionRow): boolean {
-  if (run.status !== "running") {
-    return false;
-  }
-
-  if (!run.started_at) {
-    return true;
-  }
-
-  const startedAt = Date.parse(run.started_at);
-  if (Number.isNaN(startedAt)) {
-    return true;
-  }
-
-  return Date.now() - startedAt >= RUN_RESUME_STALE_MS;
+function parseRunStatus(status: string): RunStatus | null {
+  return isRunStatus(status) ? status : null;
 }
 
 function parseForcedFailureStation(goal: string | null): StationName | null {
@@ -302,16 +287,24 @@ async function runWorkflowSkeleton(env: Env, run: RunExecutionRow): Promise<void
     }
   }
 
-  await createCompletionArtifact(env, run.id);
   const markedSucceeded = await markRunSucceeded(env, run.id);
-  if (markedSucceeded) {
-    logEvent("run.succeeded", { runId: run.id });
+  if (!markedSucceeded) {
+    logEvent("run.succeeded.noop", {
+      runId: run.id
+    });
     return;
   }
 
-  logEvent("run.succeeded.noop", {
-    runId: run.id
-  });
+  try {
+    await createCompletionArtifact(env, run.id);
+  } catch (error) {
+    logEvent("run.succeeded.artifact_error", {
+      runId: run.id,
+      error: errorMessage(error)
+    });
+  }
+
+  logEvent("run.succeeded", { runId: run.id });
 }
 
 async function processQueueMessage(env: Env, message: Message<unknown>): Promise<void> {
@@ -331,8 +324,9 @@ async function processQueueMessage(env: Env, message: Message<unknown>): Promise
     return;
   }
 
-  if (isTerminalRunStatus(run.status)) {
-    logEvent("run.skip.terminal", {
+  const runStatus = parseRunStatus(run.status);
+  if (!runStatus) {
+    logEvent("run.skip.invalid_status", {
       runId: payload.runId,
       messageId: message.id,
       status: run.status
@@ -341,15 +335,26 @@ async function processQueueMessage(env: Env, message: Message<unknown>): Promise
     return;
   }
 
-  if (run.status === "queued") {
+  if (isTerminalRunStatus(runStatus)) {
+    logEvent("run.skip.terminal", {
+      runId: payload.runId,
+      messageId: message.id,
+      status: runStatus
+    });
+    message.ack();
+    return;
+  }
+
+  if (runStatus === "queued") {
     const claimed = await claimQueuedRun(env, payload.runId);
     if (!claimed) {
       const latestRun = await getRunForExecution(env, payload.runId);
-      if (latestRun && isTerminalRunStatus(latestRun.status)) {
+      const latestStatus = latestRun ? parseRunStatus(latestRun.status) : null;
+      if (latestStatus && isTerminalRunStatus(latestStatus)) {
         logEvent("run.claim.contended.terminal", {
           runId: payload.runId,
           messageId: message.id,
-          status: latestRun.status
+          status: latestStatus
         });
         message.ack();
         return;
@@ -364,25 +369,18 @@ async function processQueueMessage(env: Env, message: Message<unknown>): Promise
     }
 
     logEvent("run.claimed", { runId: payload.runId, messageId: message.id });
-  } else if (run.status === "running") {
-    if (!shouldResumeRunningRun(run)) {
-      logEvent("run.skip.running_recent", {
-        runId: payload.runId,
-        messageId: message.id
-      });
-      message.ack();
-      return;
-    }
-
-    logEvent("run.resume", {
+  } else if (runStatus === "running") {
+    logEvent("run.defer.running", {
       runId: payload.runId,
       messageId: message.id
     });
+    message.retry();
+    return;
   } else {
     logEvent("run.skip.unexpected_status", {
       runId: payload.runId,
       messageId: message.id,
-      status: run.status
+      status: runStatus
     });
     message.ack();
     return;
@@ -423,7 +421,13 @@ async function processQueueMessage(env: Env, message: Message<unknown>): Promise
     }
 
     const latestRunAfterMark = await getRunForExecution(env, payload.runId);
-    if (!latestRunAfterMark || isTerminalRunStatus(latestRunAfterMark.status)) {
+    const latestStatusAfterMark = latestRunAfterMark
+      ? parseRunStatus(latestRunAfterMark.status)
+      : null;
+    if (
+      !latestRunAfterMark ||
+      (latestStatusAfterMark && isTerminalRunStatus(latestStatusAfterMark))
+    ) {
       message.ack();
       return;
     }
