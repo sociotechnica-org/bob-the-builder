@@ -22,6 +22,7 @@ interface RunExecutionRow {
 }
 
 const RUN_RESUME_STALE_MS = 30_000;
+const RUN_HEARTBEAT_INTERVAL_MS = 5_000;
 const LOCAL_QUEUE_CONSUME_PATH = "/__queue/consume";
 const LOCAL_QUEUE_SECRET_HEADER = "x-bob-local-queue-secret";
 
@@ -160,6 +161,20 @@ async function updateRunCurrentStation(
     .run();
 }
 
+function startRunHeartbeatLoop(env: Env, runId: string, station: StationName): () => void {
+  const timer = setInterval(() => {
+    void updateRunCurrentStation(env, runId, station).catch((error) => {
+      logEvent("run.heartbeat.error", {
+        runId,
+        station,
+        error: errorMessage(error)
+      });
+    });
+  }, RUN_HEARTBEAT_INTERVAL_MS);
+
+  return () => clearInterval(timer);
+}
+
 async function markStationRunning(
   env: Env,
   runId: string,
@@ -275,8 +290,14 @@ async function executeStation(
   await markStationRunning(env, runId, station, startedAt);
   logEvent("station.started", { runId, station });
 
-  await markStationSucceeded(env, runId, station, startedAtMs);
-  logEvent("station.succeeded", { runId, station });
+  const stopHeartbeatLoop = startRunHeartbeatLoop(env, runId, station);
+  try {
+    await markStationSucceeded(env, runId, station, startedAtMs);
+    logEvent("station.succeeded", { runId, station });
+  } finally {
+    stopHeartbeatLoop();
+  }
+
   return { ok: true };
 }
 
