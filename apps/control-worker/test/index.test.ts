@@ -1,5 +1,5 @@
 import type { RunQueueMessage } from "@bob/core";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { handleRequest, type Env } from "../src/index";
 
 interface RepoRow {
@@ -927,6 +927,49 @@ describe("control worker", () => {
     const retryPayload = await parseJson(retryResponse);
     const idempotency = retryPayload.idempotency as Record<string, unknown>;
     expect(idempotency.requeued).toBe(true);
+  });
+
+  it("treats local queue bridge dispatch failures as enqueue failures", async () => {
+    const { env, queue } = createEnv();
+    await createRepo(env);
+    env.LOCAL_QUEUE_CONSUMER_URL = "http://127.0.0.1:20288";
+    env.LOCAL_QUEUE_SHARED_SECRET = "bridge-secret";
+
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response("bridge unavailable", { status: 503 }));
+
+    try {
+      const runBody = JSON.stringify({
+        repo: { owner: "sociotechnica-org", name: "lifebuild" },
+        issue: { number: 333 },
+        requestor: "jess",
+        prMode: "draft"
+      });
+
+      const failedResponse = await handleRequest(
+        new Request("https://example.com/v1/runs", {
+          method: "POST",
+          headers: authHeaders({
+            "content-type": "application/json",
+            "idempotency-key": "local-bridge-failure"
+          }),
+          body: runBody
+        }),
+        env
+      );
+
+      expect(failedResponse.status).toBe(503);
+      const failedPayload = await parseJson(failedResponse);
+      const failedRun = failedPayload.run as Record<string, unknown>;
+      const failedIdempotency = failedPayload.idempotency as Record<string, unknown>;
+      expect(failedRun.status).toBe("queued");
+      expect(failedRun.failureReason).toBe("queue_publish_failed");
+      expect(failedIdempotency.status).toBe("failed");
+      expect(queue.messages).toHaveLength(1);
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
   it("retries queue publish when failed idempotency update throws after enqueue error", async () => {

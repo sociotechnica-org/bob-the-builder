@@ -15,10 +15,10 @@ export interface Env {
 
 interface RunExecutionRow {
   id: string;
-  goal: string | null;
   status: string;
   current_station: string | null;
   started_at: string | null;
+  heartbeat_at: string | null;
 }
 
 const RUN_RESUME_STALE_MS = 30_000;
@@ -67,30 +67,17 @@ function shouldResumeRunningRun(run: RunExecutionRow): boolean {
     return false;
   }
 
-  if (!run.started_at) {
+  const lastHeartbeat = run.heartbeat_at ?? run.started_at;
+  if (!lastHeartbeat) {
     return true;
   }
 
-  const startedAt = Date.parse(run.started_at);
-  if (Number.isNaN(startedAt)) {
+  const heartbeatAt = Date.parse(lastHeartbeat);
+  if (Number.isNaN(heartbeatAt)) {
     return true;
   }
 
-  return Date.now() - startedAt >= RUN_RESUME_STALE_MS;
-}
-
-function parseForcedFailureStation(goal: string | null): StationName | null {
-  if (!goal) {
-    return null;
-  }
-
-  const match = goal.match(/force_fail:([a-z_]+)/i);
-  if (!match) {
-    return null;
-  }
-
-  const candidate = match[1]?.toLowerCase();
-  return STATION_NAMES.find((station) => station === candidate) ?? null;
+  return Date.now() - heartbeatAt >= RUN_RESUME_STALE_MS;
 }
 
 function stationExecutionId(runId: string, station: StationName): string {
@@ -101,19 +88,54 @@ async function claimQueuedRun(env: Env, runId: string): Promise<boolean> {
   const claimedAt = nowIso();
   const result = await env.DB.prepare(
     `UPDATE runs
-     SET status = ?, started_at = COALESCE(started_at, ?), current_station = ?, failure_reason = ?
+     SET status = ?, started_at = COALESCE(started_at, ?), current_station = ?, heartbeat_at = ?, failure_reason = ?
      WHERE id = ? AND status = ?`
   )
-    .bind("running", claimedAt, STATION_NAMES[0], null, runId, "queued")
+    .bind("running", claimedAt, STATION_NAMES[0], claimedAt, null, runId, "queued")
     .run();
 
+  return getAffectedRowCount(result) === 1;
+}
+
+async function claimStaleRunningRun(env: Env, run: RunExecutionRow): Promise<boolean> {
+  const resumedAt = nowIso();
+
+  if (run.heartbeat_at) {
+    const result = await env.DB.prepare(
+      `UPDATE runs
+       SET heartbeat_at = ?
+       WHERE id = ? AND status = ? AND heartbeat_at = ?`
+    )
+      .bind(resumedAt, run.id, "running", run.heartbeat_at)
+      .run();
+    return getAffectedRowCount(result) === 1;
+  }
+
+  if (run.started_at) {
+    const result = await env.DB.prepare(
+      `UPDATE runs
+       SET heartbeat_at = ?
+       WHERE id = ? AND status = ? AND heartbeat_at IS NULL AND started_at = ?`
+    )
+      .bind(resumedAt, run.id, "running", run.started_at)
+      .run();
+    return getAffectedRowCount(result) === 1;
+  }
+
+  const result = await env.DB.prepare(
+    `UPDATE runs
+     SET heartbeat_at = ?
+     WHERE id = ? AND status = ? AND heartbeat_at IS NULL AND started_at IS NULL`
+  )
+    .bind(resumedAt, run.id, "running")
+    .run();
   return getAffectedRowCount(result) === 1;
 }
 
 async function getRunForExecution(env: Env, runId: string): Promise<RunExecutionRow | null> {
   return (
     (await env.DB.prepare(
-      `SELECT id, goal, status, current_station, started_at
+      `SELECT id, status, current_station, started_at, heartbeat_at
        FROM runs
        WHERE id = ?
        LIMIT 1`
@@ -128,12 +150,13 @@ async function updateRunCurrentStation(
   runId: string,
   station: StationName
 ): Promise<void> {
+  const heartbeatAt = nowIso();
   await env.DB.prepare(
     `UPDATE runs
-     SET current_station = ?
-     WHERE id = ?`
+     SET current_station = ?, heartbeat_at = ?
+     WHERE id = ? AND status = ?`
   )
-    .bind(station, runId)
+    .bind(station, heartbeatAt, runId, "running")
     .run();
 }
 
@@ -190,37 +213,13 @@ async function markStationSucceeded(
     .run();
 }
 
-async function markStationFailed(
-  env: Env,
-  runId: string,
-  station: StationName,
-  startedAtMs: number,
-  reason: string
-): Promise<void> {
-  const finishedAt = nowIso();
-  const durationMs = Math.max(1, Date.now() - startedAtMs);
-  await env.DB.prepare(
-    `UPDATE station_executions
-     SET status = ?, finished_at = ?, duration_ms = ?, summary = ?
-     WHERE id = ?`
-  )
-    .bind(
-      "failed",
-      finishedAt,
-      durationMs,
-      reason.slice(0, 500),
-      stationExecutionId(runId, station)
-    )
-    .run();
-}
-
 async function markRunSucceeded(env: Env, runId: string): Promise<boolean> {
   const result = await env.DB.prepare(
     `UPDATE runs
-     SET status = ?, finished_at = ?, current_station = ?, failure_reason = ?
+     SET status = ?, finished_at = ?, current_station = ?, failure_reason = ?, heartbeat_at = ?
      WHERE id = ? AND status = ?`
   )
-    .bind("succeeded", nowIso(), null, null, runId, "running")
+    .bind("succeeded", nowIso(), null, null, nowIso(), runId, "running")
     .run();
 
   return getAffectedRowCount(result) === 1;
@@ -234,10 +233,10 @@ async function markRunFailed(
 ): Promise<boolean> {
   const result = await env.DB.prepare(
     `UPDATE runs
-     SET status = ?, finished_at = ?, current_station = ?, failure_reason = ?
+     SET status = ?, finished_at = ?, current_station = ?, failure_reason = ?, heartbeat_at = ?
      WHERE id = ? AND status = ?`
   )
-    .bind("failed", nowIso(), station, reason.slice(0, 500), runId, "running")
+    .bind("failed", nowIso(), station, reason.slice(0, 500), nowIso(), runId, "running")
     .run();
 
   return getAffectedRowCount(result) === 1;
@@ -267,8 +266,7 @@ async function createCompletionArtifact(env: Env, runId: string): Promise<void> 
 async function executeStation(
   env: Env,
   runId: string,
-  station: StationName,
-  forcedFailureStation: StationName | null
+  station: StationName
 ): Promise<{ ok: boolean; error?: string }> {
   const startedAt = nowIso();
   const startedAtMs = Date.now();
@@ -277,23 +275,14 @@ async function executeStation(
   await markStationRunning(env, runId, station, startedAt);
   logEvent("station.started", { runId, station });
 
-  if (forcedFailureStation === station) {
-    const reason = `Station ${station} failed due to forced failure marker`;
-    await markStationFailed(env, runId, station, startedAtMs, reason);
-    logEvent("station.failed", { runId, station, reason });
-    return { ok: false, error: reason };
-  }
-
   await markStationSucceeded(env, runId, station, startedAtMs);
   logEvent("station.succeeded", { runId, station });
   return { ok: true };
 }
 
 async function runWorkflowSkeleton(env: Env, run: RunExecutionRow): Promise<void> {
-  const forcedFailureStation = parseForcedFailureStation(run.goal);
-
   for (const station of STATION_NAMES) {
-    const result = await executeStation(env, run.id, station, forcedFailureStation);
+    const result = await executeStation(env, run.id, station);
     if (!result.ok) {
       await markRunFailed(env, run.id, station, result.error ?? `Station ${station} failed`);
       logEvent("run.failed", {
@@ -390,6 +379,16 @@ async function processQueueMessage(env: Env, message: Message<unknown>): Promise
   } else if (runStatus === "running") {
     if (!shouldResumeRunningRun(run)) {
       logEvent("run.defer.running", {
+        runId: payload.runId,
+        messageId: message.id
+      });
+      message.retry();
+      return;
+    }
+
+    const claimedResume = await claimStaleRunningRun(env, run);
+    if (!claimedResume) {
+      logEvent("run.resume.claim_contended", {
         runId: payload.runId,
         messageId: message.id
       });

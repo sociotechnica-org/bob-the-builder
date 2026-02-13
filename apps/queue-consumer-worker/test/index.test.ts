@@ -7,6 +7,7 @@ interface RunRow {
   status: string;
   current_station: string | null;
   started_at: string | null;
+  heartbeat_at: string | null;
   finished_at: string | null;
   failure_reason: string | null;
 }
@@ -69,13 +70,17 @@ class MockD1Database {
   private readonly artifacts: ArtifactRow[] = [];
   private failNextArtifactInsert = false;
   private failedRunStatusUpdatesToFail = 0;
+  private stationSuccessFailures = new Map<string, number>();
 
   public prepare(sql: string): D1PreparedStatement {
     return new MockD1PreparedStatement(this, normalizeSql(sql)) as unknown as D1PreparedStatement;
   }
 
-  public seedRun(run: RunRow): void {
-    this.runs.push(run);
+  public seedRun(run: Omit<RunRow, "heartbeat_at"> & { heartbeat_at?: string | null }): void {
+    this.runs.push({
+      ...run,
+      heartbeat_at: run.heartbeat_at ?? null
+    });
   }
 
   public getRun(runId: string): RunRow | undefined {
@@ -98,9 +103,14 @@ class MockD1Database {
     this.failedRunStatusUpdatesToFail += Math.max(1, count);
   }
 
+  public failOnStationSuccess(station: string, count = 1): void {
+    const existing = this.stationSuccessFailures.get(station) ?? 0;
+    this.stationSuccessFailures.set(station, existing + Math.max(1, count));
+  }
+
   public first(sql: string, params: unknown[]): unknown {
     if (
-      sql.includes("select id, goal, status, current_station, started_at from runs") &&
+      sql.includes("select id, status, current_station, started_at, heartbeat_at from runs") &&
       sql.includes("where id = ?")
     ) {
       const runId = asString(params[0]);
@@ -111,10 +121,10 @@ class MockD1Database {
 
       return {
         id: run.id,
-        goal: run.goal,
         status: run.status,
         current_station: run.current_station,
-        started_at: run.started_at
+        started_at: run.started_at,
+        heartbeat_at: run.heartbeat_at
       };
     }
 
@@ -127,8 +137,8 @@ class MockD1Database {
       sql.includes("set status = ?") &&
       sql.includes("coalesce(started_at")
     ) {
-      const runId = asString(params[4]);
-      const expectedStatus = asString(params[5]);
+      const runId = asString(params[5]);
+      const expectedStatus = asString(params[6]);
       const run = this.runs.find((candidate) => candidate.id === runId);
       if (!run || run.status !== expectedStatus) {
         return 0;
@@ -137,22 +147,86 @@ class MockD1Database {
       run.status = asString(params[0]);
       run.started_at = run.started_at ?? asString(params[1]);
       run.current_station = asNullableString(params[2]);
-      run.failure_reason = asNullableString(params[3]);
+      run.heartbeat_at = asNullableString(params[3]);
+      run.failure_reason = asNullableString(params[4]);
       return 1;
     }
 
     if (
       sql.startsWith("update runs") &&
       sql.includes("set current_station = ?") &&
-      sql.includes("where id = ?")
+      sql.includes("heartbeat_at = ?") &&
+      sql.includes("where id = ? and status = ?")
     ) {
-      const runId = asString(params[1]);
+      const runId = asString(params[2]);
+      const expectedStatus = asString(params[3]);
       const run = this.runs.find((candidate) => candidate.id === runId);
-      if (!run) {
+      if (!run || run.status !== expectedStatus) {
         return 0;
       }
 
       run.current_station = asNullableString(params[0]);
+      run.heartbeat_at = asNullableString(params[1]);
+      return 1;
+    }
+
+    if (
+      sql.startsWith("update runs") &&
+      sql.includes("set heartbeat_at = ?") &&
+      sql.includes("where id = ? and status = ? and heartbeat_at = ?")
+    ) {
+      const runId = asString(params[1]);
+      const expectedStatus = asString(params[2]);
+      const expectedHeartbeatAt = asString(params[3]);
+      const run = this.runs.find((candidate) => candidate.id === runId);
+      if (!run || run.status !== expectedStatus || run.heartbeat_at !== expectedHeartbeatAt) {
+        return 0;
+      }
+
+      run.heartbeat_at = asString(params[0]);
+      return 1;
+    }
+
+    if (
+      sql.startsWith("update runs") &&
+      sql.includes("set heartbeat_at = ?") &&
+      sql.includes("where id = ? and status = ? and heartbeat_at is null and started_at = ?")
+    ) {
+      const runId = asString(params[1]);
+      const expectedStatus = asString(params[2]);
+      const expectedStartedAt = asString(params[3]);
+      const run = this.runs.find((candidate) => candidate.id === runId);
+      if (
+        !run ||
+        run.status !== expectedStatus ||
+        run.heartbeat_at !== null ||
+        run.started_at !== expectedStartedAt
+      ) {
+        return 0;
+      }
+
+      run.heartbeat_at = asString(params[0]);
+      return 1;
+    }
+
+    if (
+      sql.startsWith("update runs") &&
+      sql.includes("set heartbeat_at = ?") &&
+      sql.includes("where id = ? and status = ? and heartbeat_at is null and started_at is null")
+    ) {
+      const runId = asString(params[1]);
+      const expectedStatus = asString(params[2]);
+      const run = this.runs.find((candidate) => candidate.id === runId);
+      if (
+        !run ||
+        run.status !== expectedStatus ||
+        run.heartbeat_at !== null ||
+        run.started_at !== null
+      ) {
+        return 0;
+      }
+
+      run.heartbeat_at = asString(params[0]);
       return 1;
     }
 
@@ -191,6 +265,16 @@ class MockD1Database {
         return 0;
       }
 
+      const nextStatus = asString(params[0]);
+      if (nextStatus === "succeeded") {
+        const station = asStationFromExecutionId(id);
+        const remainingFailures = this.stationSuccessFailures.get(station) ?? 0;
+        if (remainingFailures > 0) {
+          this.stationSuccessFailures.set(station, remainingFailures - 1);
+          throw new Error(`Simulated station success error for ${station}`);
+        }
+      }
+
       row.status = asString(params[0]);
       row.finished_at = asNullableString(params[1]);
       row.duration_ms = asNullableNumber(params[2]);
@@ -203,10 +287,11 @@ class MockD1Database {
       sql.includes("set status = ?") &&
       sql.includes("finished_at = ?") &&
       sql.includes("failure_reason = ?") &&
+      sql.includes("heartbeat_at = ?") &&
       sql.includes("where id = ? and status = ?")
     ) {
-      const runId = asString(params[4]);
-      const expectedStatus = asString(params[5]);
+      const runId = asString(params[5]);
+      const expectedStatus = asString(params[6]);
       const run = this.runs.find((candidate) => candidate.id === runId);
       if (!run || run.status !== expectedStatus) {
         return 0;
@@ -222,6 +307,7 @@ class MockD1Database {
       run.finished_at = asNullableString(params[1]);
       run.current_station = asNullableString(params[2]);
       run.failure_reason = asNullableString(params[3]);
+      run.heartbeat_at = asNullableString(params[4]);
       return 1;
     }
 
@@ -318,6 +404,17 @@ function asNullableNumber(value: unknown): number | null {
   return value;
 }
 
+function asStationFromExecutionId(executionId: string): string {
+  const stations = ["intake", "plan", "implement", "verify", "create_pr"];
+  for (const station of stations) {
+    if (executionId.endsWith(`_${station}`)) {
+      return station;
+    }
+  }
+
+  throw new Error(`Unsupported station execution id: ${executionId}`);
+}
+
 describe("queue-consumer worker", () => {
   it("acks invalid queue messages", async () => {
     const { env, db } = createEnv();
@@ -397,6 +494,7 @@ describe("queue-consumer worker", () => {
       status: "running",
       current_station: "plan",
       started_at: new Date(Date.now() - 31_000).toISOString(),
+      heartbeat_at: new Date(Date.now() - 31_000).toISOString(),
       finished_at: null,
       failure_reason: null
     });
@@ -432,6 +530,7 @@ describe("queue-consumer worker", () => {
       status: "running",
       current_station: "plan",
       started_at: new Date().toISOString(),
+      heartbeat_at: new Date().toISOString(),
       finished_at: null,
       failure_reason: null
     });
@@ -459,17 +558,18 @@ describe("queue-consumer worker", () => {
     expect(db.listArtifacts("run_running_recent")).toHaveLength(0);
   });
 
-  it("marks runs failed when a station is forced to fail", async () => {
+  it("marks runs failed when a station execution throws", async () => {
     const { env, db } = createEnv();
     db.seedRun({
       id: "run_failure",
-      goal: "force_fail:verify",
+      goal: null,
       status: "queued",
       current_station: null,
       started_at: null,
       finished_at: null,
       failure_reason: null
     });
+    db.failOnStationSuccess("verify");
 
     const message = createMessage("msg_failure", {
       runId: "run_failure",
@@ -491,11 +591,11 @@ describe("queue-consumer worker", () => {
     expect(message.acked).toBe(true);
     expect(run?.status).toBe("failed");
     expect(run?.current_station).toBe("verify");
-    expect(run?.failure_reason).toContain("forced failure marker");
+    expect(run?.failure_reason).toContain("Workflow execution error");
 
     const stations = db.listStations("run_failure");
     const verifyStation = stations.find((station) => station.station === "verify");
-    expect(verifyStation?.status).toBe("failed");
+    expect(verifyStation?.status).toBe("running");
 
     const createPrStation = stations.find((station) => station.station === "create_pr");
     expect(createPrStation).toBeUndefined();
@@ -543,14 +643,15 @@ describe("queue-consumer worker", () => {
     const { env, db } = createEnv();
     db.seedRun({
       id: "run_failed_persist_retry",
-      goal: "force_fail:verify",
+      goal: null,
       status: "queued",
       current_station: null,
       started_at: null,
       finished_at: null,
       failure_reason: null
     });
-    db.failOnNextFailedRunStatusUpdate(2);
+    db.failOnStationSuccess("verify");
+    db.failOnNextFailedRunStatusUpdate();
 
     const message = createMessage("msg_failed_persist_retry", {
       runId: "run_failed_persist_retry",

@@ -87,6 +87,10 @@ function startWorker(): ChildProcessByStdio<null, Readable, Readable> {
       String(inspectorPort),
       "--var",
       `BOB_PASSWORD:${PASSWORD}`,
+      "--var",
+      "LOCAL_QUEUE_CONSUMER_URL:",
+      "--var",
+      "LOCAL_QUEUE_SHARED_SECRET:",
       "--show-interactive-dev-session=false",
       "--log-level",
       "warn"

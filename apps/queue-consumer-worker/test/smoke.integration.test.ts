@@ -7,6 +7,7 @@ interface RunRow {
   status: string;
   current_station: string | null;
   started_at: string | null;
+  heartbeat_at: string | null;
   finished_at: string | null;
   failure_reason: string | null;
 }
@@ -68,8 +69,11 @@ class MockD1Database {
     return new MockD1PreparedStatement(this, normalizeSql(sql)) as unknown as D1PreparedStatement;
   }
 
-  public seedRun(run: RunRow): void {
-    this.runs.push(run);
+  public seedRun(run: Omit<RunRow, "heartbeat_at"> & { heartbeat_at?: string | null }): void {
+    this.runs.push({
+      ...run,
+      heartbeat_at: run.heartbeat_at ?? null
+    });
   }
 
   public getRun(runId: string): RunRow | undefined {
@@ -86,7 +90,7 @@ class MockD1Database {
 
   public first(sql: string, params: unknown[]): unknown {
     if (
-      sql.includes("select id, goal, status, current_station, started_at from runs") &&
+      sql.includes("select id, status, current_station, started_at, heartbeat_at from runs") &&
       sql.includes("where id = ?")
     ) {
       const runId = asString(params[0]);
@@ -97,10 +101,10 @@ class MockD1Database {
 
       return {
         id: run.id,
-        goal: run.goal,
         status: run.status,
         current_station: run.current_station,
-        started_at: run.started_at
+        started_at: run.started_at,
+        heartbeat_at: run.heartbeat_at
       };
     }
 
@@ -109,7 +113,7 @@ class MockD1Database {
 
   public run(sql: string, params: unknown[]): number {
     if (sql.startsWith("update runs") && sql.includes("coalesce(started_at")) {
-      const runId = asString(params[4]);
+      const runId = asString(params[5]);
       const run = this.runs.find((candidate) => candidate.id === runId);
       if (!run || run.status !== "queued") {
         return 0;
@@ -118,22 +122,25 @@ class MockD1Database {
       run.status = "running";
       run.started_at = run.started_at ?? asString(params[1]);
       run.current_station = asNullableString(params[2]);
-      run.failure_reason = asNullableString(params[3]);
+      run.heartbeat_at = asNullableString(params[3]);
+      run.failure_reason = asNullableString(params[4]);
       return 1;
     }
 
     if (
       sql.startsWith("update runs") &&
       sql.includes("set current_station = ?") &&
-      sql.includes("where id = ?")
+      sql.includes("heartbeat_at = ?") &&
+      sql.includes("where id = ? and status = ?")
     ) {
-      const runId = asString(params[1]);
+      const runId = asString(params[2]);
       const run = this.runs.find((candidate) => candidate.id === runId);
-      if (!run) {
+      if (!run || run.status !== "running") {
         return 0;
       }
 
       run.current_station = asNullableString(params[0]);
+      run.heartbeat_at = asNullableString(params[1]);
       return 1;
     }
 
@@ -180,10 +187,11 @@ class MockD1Database {
       sql.startsWith("update runs") &&
       sql.includes("set status = ?") &&
       sql.includes("finished_at = ?") &&
+      sql.includes("heartbeat_at = ?") &&
       sql.includes("where id = ? and status = ?")
     ) {
-      const runId = asString(params[4]);
-      const expectedStatus = asString(params[5]);
+      const runId = asString(params[5]);
+      const expectedStatus = asString(params[6]);
       const run = this.runs.find((candidate) => candidate.id === runId);
       if (!run || run.status !== expectedStatus) {
         return 0;
@@ -193,6 +201,62 @@ class MockD1Database {
       run.finished_at = asNullableString(params[1]);
       run.current_station = asNullableString(params[2]);
       run.failure_reason = asNullableString(params[3]);
+      run.heartbeat_at = asNullableString(params[4]);
+      return 1;
+    }
+
+    if (
+      sql.startsWith("update runs") &&
+      sql.includes("set heartbeat_at = ?") &&
+      sql.includes("where id = ? and status = ? and heartbeat_at = ?")
+    ) {
+      const runId = asString(params[1]);
+      const run = this.runs.find((candidate) => candidate.id === runId);
+      if (!run || run.status !== "running" || run.heartbeat_at !== asString(params[3])) {
+        return 0;
+      }
+
+      run.heartbeat_at = asString(params[0]);
+      return 1;
+    }
+
+    if (
+      sql.startsWith("update runs") &&
+      sql.includes("set heartbeat_at = ?") &&
+      sql.includes("where id = ? and status = ? and heartbeat_at is null and started_at = ?")
+    ) {
+      const runId = asString(params[1]);
+      const run = this.runs.find((candidate) => candidate.id === runId);
+      if (
+        !run ||
+        run.status !== "running" ||
+        run.heartbeat_at !== null ||
+        run.started_at !== asString(params[3])
+      ) {
+        return 0;
+      }
+
+      run.heartbeat_at = asString(params[0]);
+      return 1;
+    }
+
+    if (
+      sql.startsWith("update runs") &&
+      sql.includes("set heartbeat_at = ?") &&
+      sql.includes("where id = ? and status = ? and heartbeat_at is null and started_at is null")
+    ) {
+      const runId = asString(params[1]);
+      const run = this.runs.find((candidate) => candidate.id === runId);
+      if (
+        !run ||
+        run.status !== "running" ||
+        run.heartbeat_at !== null ||
+        run.started_at !== null
+      ) {
+        return 0;
+      }
+
+      run.heartbeat_at = asString(params[0]);
       return 1;
     }
 

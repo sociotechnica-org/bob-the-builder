@@ -798,27 +798,12 @@ async function dispatchLocalQueueMessageIfConfigured(
     headers[LOCAL_QUEUE_SECRET_HEADER] = env.LOCAL_QUEUE_SHARED_SECRET.trim();
   }
 
+  let response: Response;
   try {
-    const response = await fetch(endpoint, {
+    response = await fetch(endpoint, {
       method: "POST",
       headers,
       body: JSON.stringify(message)
-    });
-
-    if (!response.ok) {
-      const body = (await response.text()).slice(0, 500);
-      logEvent("run.local_queue_bridge.failed", {
-        runId: run.id,
-        endpoint,
-        status: response.status,
-        body
-      });
-      return;
-    }
-
-    logEvent("run.local_queue_bridge.dispatched", {
-      runId: run.id,
-      endpoint
     });
   } catch (error) {
     logEvent("run.local_queue_bridge.error", {
@@ -826,7 +811,24 @@ async function dispatchLocalQueueMessageIfConfigured(
       endpoint,
       error: errorMessage(error)
     });
+    throw new Error(`Failed to dispatch local queue bridge: ${errorMessage(error)}`);
   }
+
+  if (!response.ok) {
+    const body = (await response.text()).slice(0, 500);
+    logEvent("run.local_queue_bridge.failed", {
+      runId: run.id,
+      endpoint,
+      status: response.status,
+      body
+    });
+    throw new Error(`Local queue bridge returned ${response.status}`);
+  }
+
+  logEvent("run.local_queue_bridge.dispatched", {
+    runId: run.id,
+    endpoint
+  });
 }
 
 async function enqueueRun(env: Env, run: RunWithRepoRow): Promise<void> {
