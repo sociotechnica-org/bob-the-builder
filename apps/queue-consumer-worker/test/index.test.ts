@@ -95,6 +95,10 @@ class MockD1Database {
     return this.artifacts.filter((row) => row.run_id === runId);
   }
 
+  public seedStationExecution(row: StationExecutionRow): void {
+    this.stationExecutions.push(row);
+  }
+
   public failOnNextArtifactInsert(): void {
     this.failNextArtifactInsert = true;
   }
@@ -126,6 +130,12 @@ class MockD1Database {
         started_at: run.started_at,
         heartbeat_at: run.heartbeat_at
       };
+    }
+
+    if (sql.includes("select status from station_executions") && sql.includes("where id = ?")) {
+      const stationExecutionId = asString(params[0]);
+      const row = this.stationExecutions.find((candidate) => candidate.id === stationExecutionId);
+      return row ? { status: row.status } : null;
     }
 
     throw new Error(`Unsupported first SQL: ${sql}`);
@@ -258,7 +268,11 @@ class MockD1Database {
       return 1;
     }
 
-    if (sql.startsWith("update station_executions") && sql.includes("set status = ?")) {
+    if (
+      sql.startsWith("update station_executions") &&
+      sql.includes("set status = ?") &&
+      sql.includes("duration_ms = ?")
+    ) {
       const id = asString(params[4]);
       const row = this.stationExecutions.find((station) => station.id === id);
       if (!row) {
@@ -279,6 +293,24 @@ class MockD1Database {
       row.finished_at = asNullableString(params[1]);
       row.duration_ms = asNullableNumber(params[2]);
       row.summary = asNullableString(params[3]);
+      return 1;
+    }
+
+    if (
+      sql.startsWith("update station_executions") &&
+      sql.includes("set status = ?") &&
+      sql.includes("where id = ? and status = ?")
+    ) {
+      const id = asString(params[3]);
+      const expectedStatus = asString(params[4]);
+      const row = this.stationExecutions.find((station) => station.id === id);
+      if (!row || row.status !== expectedStatus) {
+        return 0;
+      }
+
+      row.status = asString(params[0]);
+      row.finished_at = asNullableString(params[1]);
+      row.summary = asNullableString(params[2]);
       return 1;
     }
 
@@ -498,6 +530,16 @@ describe("queue-consumer worker", () => {
       finished_at: null,
       failure_reason: null
     });
+    db.seedStationExecution({
+      id: "station_run_duplicate_intake",
+      run_id: "run_duplicate",
+      station: "intake",
+      status: "succeeded",
+      started_at: new Date(Date.now() - 60_000).toISOString(),
+      finished_at: new Date(Date.now() - 59_000).toISOString(),
+      duration_ms: 1_000,
+      summary: "intake done before crash"
+    });
 
     const message = createMessage("msg_duplicate", {
       runId: "run_duplicate",
@@ -519,6 +561,10 @@ describe("queue-consumer worker", () => {
     expect(message.retries).toBe(0);
     expect(db.getRun("run_duplicate")?.status).toBe("succeeded");
     expect(db.listStations("run_duplicate")).toHaveLength(5);
+    const intakeStation = db
+      .listStations("run_duplicate")
+      .find((station) => station.station === "intake");
+    expect(intakeStation?.summary).toBe("intake done before crash");
     expect(db.listArtifacts("run_duplicate")).toHaveLength(1);
   });
 
@@ -595,7 +641,8 @@ describe("queue-consumer worker", () => {
 
     const stations = db.listStations("run_failure");
     const verifyStation = stations.find((station) => station.station === "verify");
-    expect(verifyStation?.status).toBe("running");
+    expect(verifyStation?.status).toBe("failed");
+    expect(verifyStation?.summary).toContain("execution error");
 
     const createPrStation = stations.find((station) => station.station === "create_pr");
     expect(createPrStation).toBeUndefined();
@@ -672,5 +719,9 @@ describe("queue-consumer worker", () => {
     expect(message.acked).toBe(false);
     expect(message.retries).toBe(1);
     expect(db.getRun("run_failed_persist_retry")?.status).toBe("running");
+    const verifyStation = db
+      .listStations("run_failed_persist_retry")
+      .find((station) => station.station === "verify");
+    expect(verifyStation?.status).toBe("failed");
   });
 });

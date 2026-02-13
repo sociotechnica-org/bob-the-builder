@@ -778,7 +778,7 @@ function buildQueueMessage(run: RunWithRepoRow): RunQueueMessage {
   };
 }
 
-async function dispatchLocalQueueMessageIfConfigured(
+async function dispatchLocalQueueMessageBestEffort(
   env: Env,
   run: RunWithRepoRow,
   message: RunQueueMessage
@@ -811,7 +811,7 @@ async function dispatchLocalQueueMessageIfConfigured(
       endpoint,
       error: errorMessage(error)
     });
-    throw new Error(`Failed to dispatch local queue bridge: ${errorMessage(error)}`);
+    return;
   }
 
   if (!response.ok) {
@@ -822,7 +822,7 @@ async function dispatchLocalQueueMessageIfConfigured(
       status: response.status,
       body
     });
-    throw new Error(`Local queue bridge returned ${response.status}`);
+    return;
   }
 
   logEvent("run.local_queue_bridge.dispatched", {
@@ -833,8 +833,9 @@ async function dispatchLocalQueueMessageIfConfigured(
 
 async function enqueueRun(env: Env, run: RunWithRepoRow): Promise<void> {
   const message = buildQueueMessage(run);
+  // The durable queue is the source of truth; local bridge is best-effort for local dev wiring.
   await env.RUN_QUEUE.send(message);
-  await dispatchLocalQueueMessageIfConfigured(env, run, message);
+  await dispatchLocalQueueMessageBestEffort(env, run, message);
 }
 
 function serializeIdempotency(

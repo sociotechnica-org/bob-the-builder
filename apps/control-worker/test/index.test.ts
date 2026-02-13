@@ -929,7 +929,7 @@ describe("control worker", () => {
     expect(idempotency.requeued).toBe(true);
   });
 
-  it("treats local queue bridge dispatch failures as enqueue failures", async () => {
+  it("treats local queue bridge dispatch failures as non-blocking after queue send", async () => {
     const { env, queue } = createEnv();
     await createRepo(env);
     env.LOCAL_QUEUE_CONSUMER_URL = "http://127.0.0.1:20288";
@@ -959,13 +959,28 @@ describe("control worker", () => {
         env
       );
 
-      expect(failedResponse.status).toBe(503);
+      expect(failedResponse.status).toBe(202);
       const failedPayload = await parseJson(failedResponse);
       const failedRun = failedPayload.run as Record<string, unknown>;
       const failedIdempotency = failedPayload.idempotency as Record<string, unknown>;
       expect(failedRun.status).toBe("queued");
-      expect(failedRun.failureReason).toBe("queue_publish_failed");
-      expect(failedIdempotency.status).toBe("failed");
+      expect(failedRun.failureReason).toBeNull();
+      expect(failedIdempotency.status).toBe("succeeded");
+      expect(queue.messages).toHaveLength(1);
+
+      const replayResponse = await handleRequest(
+        new Request("https://example.com/v1/runs", {
+          method: "POST",
+          headers: authHeaders({
+            "content-type": "application/json",
+            "idempotency-key": "local-bridge-failure"
+          }),
+          body: runBody
+        }),
+        env
+      );
+
+      expect(replayResponse.status).toBe(200);
       expect(queue.messages).toHaveLength(1);
     } finally {
       fetchSpy.mockRestore();

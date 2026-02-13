@@ -108,6 +108,12 @@ class MockD1Database {
       };
     }
 
+    if (sql.includes("select status from station_executions") && sql.includes("where id = ?")) {
+      const stationExecutionId = asString(params[0]);
+      const row = this.stationExecutions.find((candidate) => candidate.id === stationExecutionId);
+      return row ? { status: row.status } : null;
+    }
+
     throw new Error(`Unsupported first SQL: ${sql}`);
   }
 
@@ -169,7 +175,7 @@ class MockD1Database {
       return 1;
     }
 
-    if (sql.startsWith("update station_executions")) {
+    if (sql.startsWith("update station_executions") && sql.includes("duration_ms = ?")) {
       const id = asString(params[4]);
       const row = this.stationExecutions.find((station) => station.id === id);
       if (!row) {
@@ -180,6 +186,23 @@ class MockD1Database {
       row.finished_at = asNullableString(params[1]);
       row.duration_ms = asNullableNumber(params[2]);
       row.summary = asNullableString(params[3]);
+      return 1;
+    }
+
+    if (
+      sql.startsWith("update station_executions") &&
+      sql.includes("where id = ? and status = ?")
+    ) {
+      const id = asString(params[3]);
+      const expectedStatus = asString(params[4]);
+      const row = this.stationExecutions.find((station) => station.id === id);
+      if (!row || row.status !== expectedStatus) {
+        return 0;
+      }
+
+      row.status = asString(params[0]);
+      row.finished_at = asNullableString(params[1]);
+      row.summary = asNullableString(params[2]);
       return 1;
     }
 

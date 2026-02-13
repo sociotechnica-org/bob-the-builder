@@ -21,6 +21,10 @@ interface RunExecutionRow {
   heartbeat_at: string | null;
 }
 
+interface StationExecutionStatusRow {
+  status: string;
+}
+
 const RUN_RESUME_STALE_MS = 30_000;
 const RUN_HEARTBEAT_INTERVAL_MS = 5_000;
 const LOCAL_QUEUE_CONSUME_PATH = "/__queue/consume";
@@ -146,6 +150,42 @@ async function getRunForExecution(env: Env, runId: string): Promise<RunExecution
   );
 }
 
+async function getStationExecutionStatus(
+  env: Env,
+  runId: string,
+  station: StationName
+): Promise<string | null> {
+  const stationId = stationExecutionId(runId, station);
+  const row = await env.DB.prepare(
+    `SELECT status
+     FROM station_executions
+     WHERE id = ?
+     LIMIT 1`
+  )
+    .bind(stationId)
+    .first<StationExecutionStatusRow>();
+
+  return row?.status ?? null;
+}
+
+function getResumeStationIndex(run: RunExecutionRow, currentStationStatus: string | null): number {
+  const currentStation = asStationName(run.current_station);
+  if (!currentStation) {
+    return 0;
+  }
+
+  const currentIndex = STATION_NAMES.indexOf(currentStation);
+  if (currentIndex < 0) {
+    return 0;
+  }
+
+  if (currentStationStatus === "succeeded") {
+    return Math.min(currentIndex + 1, STATION_NAMES.length);
+  }
+
+  return currentIndex;
+}
+
 async function updateRunCurrentStation(
   env: Env,
   runId: string,
@@ -228,6 +268,21 @@ async function markStationSucceeded(
     .run();
 }
 
+async function markStationFailed(
+  env: Env,
+  runId: string,
+  station: StationName,
+  reason: string
+): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE station_executions
+     SET status = ?, finished_at = ?, summary = ?
+     WHERE id = ? AND status = ?`
+  )
+    .bind("failed", nowIso(), reason.slice(0, 500), stationExecutionId(runId, station), "running")
+    .run();
+}
+
 async function markRunSucceeded(env: Env, runId: string): Promise<boolean> {
   const result = await env.DB.prepare(
     `UPDATE runs
@@ -238,6 +293,25 @@ async function markRunSucceeded(env: Env, runId: string): Promise<boolean> {
     .run();
 
   return getAffectedRowCount(result) === 1;
+}
+
+async function markWorkflowFailure(
+  env: Env,
+  runId: string,
+  station: StationName,
+  reason: string
+): Promise<boolean> {
+  try {
+    await markStationFailed(env, runId, station, reason);
+  } catch (error) {
+    logEvent("station.failed.mark_error", {
+      runId,
+      station,
+      error: errorMessage(error)
+    });
+  }
+
+  return markRunFailed(env, runId, station, reason);
 }
 
 async function markRunFailed(
@@ -278,11 +352,7 @@ async function createCompletionArtifact(env: Env, runId: string): Promise<void> 
     .run();
 }
 
-async function executeStation(
-  env: Env,
-  runId: string,
-  station: StationName
-): Promise<{ ok: boolean; error?: string }> {
+async function executeStation(env: Env, runId: string, station: StationName): Promise<void> {
   const startedAt = nowIso();
   const startedAtMs = Date.now();
 
@@ -294,45 +364,50 @@ async function executeStation(
   try {
     await markStationSucceeded(env, runId, station, startedAtMs);
     logEvent("station.succeeded", { runId, station });
+  } catch (error) {
+    const stationError = `Station ${station} execution error: ${errorMessage(error)}`.slice(0, 500);
+    try {
+      await markStationFailed(env, runId, station, stationError);
+    } catch (markError) {
+      logEvent("station.failed.mark_error", {
+        runId,
+        station,
+        error: errorMessage(markError)
+      });
+    }
+
+    logEvent("station.failed", { runId, station, error: errorMessage(error) });
+    throw error;
   } finally {
     stopHeartbeatLoop();
   }
-
-  return { ok: true };
 }
 
-async function runWorkflowSkeleton(env: Env, run: RunExecutionRow): Promise<void> {
-  for (const station of STATION_NAMES) {
-    const result = await executeStation(env, run.id, station);
-    if (!result.ok) {
-      await markRunFailed(env, run.id, station, result.error ?? `Station ${station} failed`);
-      logEvent("run.failed", {
-        runId: run.id,
-        station,
-        reason: result.error ?? "Unknown station failure"
-      });
-      return;
-    }
+async function runWorkflowSkeleton(env: Env, runId: string, startStationIndex = 0): Promise<void> {
+  const normalizedStart = Math.max(0, Math.min(startStationIndex, STATION_NAMES.length));
+
+  for (const station of STATION_NAMES.slice(normalizedStart)) {
+    await executeStation(env, runId, station);
   }
 
-  const markedSucceeded = await markRunSucceeded(env, run.id);
+  const markedSucceeded = await markRunSucceeded(env, runId);
   if (!markedSucceeded) {
     logEvent("run.succeeded.noop", {
-      runId: run.id
+      runId
     });
     return;
   }
 
   try {
-    await createCompletionArtifact(env, run.id);
+    await createCompletionArtifact(env, runId);
   } catch (error) {
     logEvent("run.succeeded.artifact_error", {
-      runId: run.id,
+      runId,
       error: errorMessage(error)
     });
   }
 
-  logEvent("run.succeeded", { runId: run.id });
+  logEvent("run.succeeded", { runId });
 }
 
 async function processQueueMessage(env: Env, message: Message<unknown>): Promise<void> {
@@ -373,6 +448,7 @@ async function processQueueMessage(env: Env, message: Message<unknown>): Promise
     return;
   }
 
+  let startStationIndex = 0;
   if (runStatus === "queued") {
     const claimed = await claimQueuedRun(env, payload.runId);
     if (!claimed) {
@@ -421,6 +497,16 @@ async function processQueueMessage(env: Env, message: Message<unknown>): Promise
       runId: payload.runId,
       messageId: message.id
     });
+
+    const currentStation = asStationName(run.current_station);
+    if (currentStation) {
+      const currentStationStatus = await getStationExecutionStatus(
+        env,
+        payload.runId,
+        currentStation
+      );
+      startStationIndex = getResumeStationIndex(run, currentStationStatus);
+    }
   } else {
     logEvent("run.skip.unexpected_status", {
       runId: payload.runId,
@@ -432,7 +518,7 @@ async function processQueueMessage(env: Env, message: Message<unknown>): Promise
   }
 
   try {
-    await runWorkflowSkeleton(env, run);
+    await runWorkflowSkeleton(env, run.id, startStationIndex);
     message.ack();
   } catch (error) {
     const reason = `Workflow execution error: ${errorMessage(error)}`.slice(0, 500);
@@ -441,7 +527,7 @@ async function processQueueMessage(env: Env, message: Message<unknown>): Promise
     let markedFailed = false;
 
     try {
-      markedFailed = await markRunFailed(env, payload.runId, failureStation, reason);
+      markedFailed = await markWorkflowFailure(env, payload.runId, failureStation, reason);
       if (!markedFailed) {
         logEvent("run.failed.mark_skipped", {
           runId: payload.runId,
