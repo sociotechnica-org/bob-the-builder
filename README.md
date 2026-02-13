@@ -114,6 +114,15 @@ Default local ports:
 - Queue-consumer worker: `http://127.0.0.1:20288`
 - Web app: `http://127.0.0.1:6673`
 
+For reliable local end-to-end queue execution during `pnpm dev`, configure:
+
+- `apps/control-worker/.dev.vars`:
+  - `BOB_PASSWORD=...`
+  - `LOCAL_QUEUE_CONSUMER_URL=http://127.0.0.1:20288`
+  - `LOCAL_QUEUE_SHARED_SECRET=...`
+- `apps/queue-consumer-worker/.dev.vars`:
+  - `LOCAL_QUEUE_SHARED_SECRET=...` (must match control worker)
+
 Reset local runtime state and rebuild a fresh local instance:
 
 ```bash
@@ -141,16 +150,16 @@ pnpm --filter @bob/control-worker dev
 In another shell, probe endpoints:
 
 ```bash
-curl -i http://127.0.0.1:8787/healthz
-curl -i http://127.0.0.1:8787/v1/ping
-curl -i -H \"Authorization: Bearer $BOB_PASSWORD\" http://127.0.0.1:8787/v1/ping
+curl -i http://127.0.0.1:20287/healthz
+curl -i http://127.0.0.1:20287/v1/ping
+curl -i -H \"Authorization: Bearer $BOB_PASSWORD\" http://127.0.0.1:20287/v1/ping
 curl -i -H \"Authorization: Bearer $BOB_PASSWORD\" -H \"Content-Type: application/json\" \
   -d '{"owner":"sociotechnica-org","name":"lifebuild"}' \
-  http://127.0.0.1:8787/v1/repos
+  http://127.0.0.1:20287/v1/repos
 curl -i -H \"Authorization: Bearer $BOB_PASSWORD\" -H \"Content-Type: application/json\" \
   -H \"Idempotency-Key: run-123\" \
   -d '{"repo":{"owner":"sociotechnica-org","name":"lifebuild"},"issue":{"number":123},"requestor":"jess","prMode":"draft"}' \
-  http://127.0.0.1:8787/v1/runs
+  http://127.0.0.1:20287/v1/runs
 ```
 
 Run an automated local Vitest integration smoke test for the control worker:

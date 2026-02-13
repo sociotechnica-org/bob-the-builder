@@ -86,7 +86,7 @@ class MockD1Database {
 
   public first(sql: string, params: unknown[]): unknown {
     if (
-      sql.includes("select id, goal, status, current_station from runs") &&
+      sql.includes("select id, goal, status, current_station, started_at from runs") &&
       sql.includes("where id = ?")
     ) {
       const runId = asString(params[0]);
@@ -99,7 +99,8 @@ class MockD1Database {
         id: run.id,
         goal: run.goal,
         status: run.status,
-        current_station: run.current_station
+        current_station: run.current_station,
+        started_at: run.started_at
       };
     }
 
@@ -251,7 +252,9 @@ function createEnv(): { env: Env; db: MockD1Database } {
 
 describe("queue-consumer smoke", () => {
   it("serves /healthz", async () => {
-    const response = await handleFetch(new Request("https://example.com/healthz"));
+    const response = await handleFetch(new Request("https://example.com/healthz"), {
+      DB: {} as D1Database
+    });
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({

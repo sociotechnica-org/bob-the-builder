@@ -9,12 +9,16 @@ const QUEUE_FAILURE_REASON = "queue_publish_failed";
 const DEFAULT_LIST_LIMIT = 50;
 const MAX_LIST_LIMIT = 100;
 const TEXT_ENCODER = new TextEncoder();
+const LOCAL_QUEUE_CONSUME_PATH = "/__queue/consume";
+const LOCAL_QUEUE_SECRET_HEADER = "x-bob-local-queue-secret";
 
 type IdempotencyStatus = "pending" | "succeeded" | "failed";
 
 export interface Env extends PasswordEnv {
   DB: D1Database;
   RUN_QUEUE: Queue<RunQueueMessage>;
+  LOCAL_QUEUE_CONSUMER_URL?: string;
+  LOCAL_QUEUE_SHARED_SECRET?: string;
 }
 
 interface RepoRow {
@@ -774,8 +778,61 @@ function buildQueueMessage(run: RunWithRepoRow): RunQueueMessage {
   };
 }
 
+async function dispatchLocalQueueMessageIfConfigured(
+  env: Env,
+  run: RunWithRepoRow,
+  message: RunQueueMessage
+): Promise<void> {
+  const rawConsumerUrl = env.LOCAL_QUEUE_CONSUMER_URL;
+  if (!isNonEmptyString(rawConsumerUrl)) {
+    return;
+  }
+
+  const consumerUrl = rawConsumerUrl.trim().replace(/\/+$/, "");
+  const endpoint = `${consumerUrl}${LOCAL_QUEUE_CONSUME_PATH}`;
+  const headers: Record<string, string> = {
+    "content-type": "application/json"
+  };
+
+  if (isNonEmptyString(env.LOCAL_QUEUE_SHARED_SECRET)) {
+    headers[LOCAL_QUEUE_SECRET_HEADER] = env.LOCAL_QUEUE_SHARED_SECRET.trim();
+  }
+
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(message)
+    });
+
+    if (!response.ok) {
+      const body = (await response.text()).slice(0, 500);
+      logEvent("run.local_queue_bridge.failed", {
+        runId: run.id,
+        endpoint,
+        status: response.status,
+        body
+      });
+      return;
+    }
+
+    logEvent("run.local_queue_bridge.dispatched", {
+      runId: run.id,
+      endpoint
+    });
+  } catch (error) {
+    logEvent("run.local_queue_bridge.error", {
+      runId: run.id,
+      endpoint,
+      error: errorMessage(error)
+    });
+  }
+}
+
 async function enqueueRun(env: Env, run: RunWithRepoRow): Promise<void> {
-  await env.RUN_QUEUE.send(buildQueueMessage(run));
+  const message = buildQueueMessage(run);
+  await env.RUN_QUEUE.send(message);
+  await dispatchLocalQueueMessageIfConfigured(env, run, message);
 }
 
 function serializeIdempotency(

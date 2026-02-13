@@ -100,7 +100,7 @@ class MockD1Database {
 
   public first(sql: string, params: unknown[]): unknown {
     if (
-      sql.includes("select id, goal, status, current_station from runs") &&
+      sql.includes("select id, goal, status, current_station, started_at from runs") &&
       sql.includes("where id = ?")
     ) {
       const runId = asString(params[0]);
@@ -113,7 +113,8 @@ class MockD1Database {
         id: run.id,
         goal: run.goal,
         status: run.status,
-        current_station: run.current_station
+        current_station: run.current_station,
+        started_at: run.started_at
       };
     }
 
@@ -388,14 +389,14 @@ describe("queue-consumer worker", () => {
     expect(artifacts[0]?.type).toBe("workflow_summary");
   });
 
-  it("replays running runs when queue messages are redelivered", async () => {
+  it("replays stale running runs when queue messages are redelivered", async () => {
     const { env, db } = createEnv();
     db.seedRun({
       id: "run_duplicate",
       goal: null,
       status: "running",
       current_station: "plan",
-      started_at: new Date().toISOString(),
+      started_at: new Date(Date.now() - 31_000).toISOString(),
       finished_at: null,
       failure_reason: null
     });
@@ -420,6 +421,41 @@ describe("queue-consumer worker", () => {
     expect(db.getRun("run_duplicate")?.status).toBe("succeeded");
     expect(db.listStations("run_duplicate")).toHaveLength(5);
     expect(db.listArtifacts("run_duplicate")).toHaveLength(1);
+  });
+
+  it("acks recent running runs to avoid duplicate concurrent execution", async () => {
+    const { env, db } = createEnv();
+    db.seedRun({
+      id: "run_running_recent",
+      goal: null,
+      status: "running",
+      current_station: "plan",
+      started_at: new Date().toISOString(),
+      finished_at: null,
+      failure_reason: null
+    });
+
+    const message = createMessage("msg_running_recent", {
+      runId: "run_running_recent",
+      repoId: "repo_1",
+      issueNumber: 999,
+      requestedAt: new Date().toISOString(),
+      requestor: "jess",
+      prMode: "draft"
+    });
+
+    await handleQueue(
+      {
+        messages: [message as unknown as Message<unknown>]
+      } as MessageBatch<unknown>,
+      env
+    );
+
+    expect(message.acked).toBe(true);
+    expect(message.retries).toBe(0);
+    expect(db.getRun("run_running_recent")?.status).toBe("running");
+    expect(db.listStations("run_running_recent")).toHaveLength(0);
+    expect(db.listArtifacts("run_running_recent")).toHaveLength(0);
   });
 
   it("marks runs failed when a station is forced to fail", async () => {

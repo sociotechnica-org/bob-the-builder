@@ -7,6 +7,7 @@ import {
 
 export interface Env {
   DB: D1Database;
+  LOCAL_QUEUE_SHARED_SECRET?: string;
 }
 
 interface RunExecutionRow {
@@ -14,7 +15,12 @@ interface RunExecutionRow {
   goal: string | null;
   status: string;
   current_station: string | null;
+  started_at: string | null;
 }
+
+const RUN_RESUME_STALE_MS = 30_000;
+const LOCAL_QUEUE_CONSUME_PATH = "/__queue/consume";
+const LOCAL_QUEUE_SECRET_HEADER = "x-bob-local-queue-secret";
 
 function json(status: number, body: Record<string, unknown>): Response {
   return Response.json(body, { status });
@@ -53,6 +59,23 @@ function isTerminalRunStatus(status: string): boolean {
   return status === "succeeded" || status === "failed" || status === "canceled";
 }
 
+function shouldResumeRunningRun(run: RunExecutionRow): boolean {
+  if (run.status !== "running") {
+    return false;
+  }
+
+  if (!run.started_at) {
+    return true;
+  }
+
+  const startedAt = Date.parse(run.started_at);
+  if (Number.isNaN(startedAt)) {
+    return true;
+  }
+
+  return Date.now() - startedAt >= RUN_RESUME_STALE_MS;
+}
+
 function parseForcedFailureStation(goal: string | null): StationName | null {
   if (!goal) {
     return null;
@@ -87,7 +110,7 @@ async function claimQueuedRun(env: Env, runId: string): Promise<boolean> {
 async function getRunForExecution(env: Env, runId: string): Promise<RunExecutionRow | null> {
   return (
     (await env.DB.prepare(
-      `SELECT id, goal, status, current_station
+      `SELECT id, goal, status, current_station, started_at
        FROM runs
        WHERE id = ?
        LIMIT 1`
@@ -342,6 +365,15 @@ async function processQueueMessage(env: Env, message: Message<unknown>): Promise
 
     logEvent("run.claimed", { runId: payload.runId, messageId: message.id });
   } else if (run.status === "running") {
+    if (!shouldResumeRunningRun(run)) {
+      logEvent("run.skip.running_recent", {
+        runId: payload.runId,
+        messageId: message.id
+      });
+      message.ack();
+      return;
+    }
+
     logEvent("run.resume", {
       runId: payload.runId,
       messageId: message.id
@@ -410,9 +442,47 @@ export async function handleQueue(batch: MessageBatch<unknown>, env: Env): Promi
   }
 }
 
-export async function handleFetch(request: Request): Promise<Response> {
+export async function handleFetch(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
-  if (request.method.toUpperCase() === "GET" && url.pathname === "/healthz") {
+  const method = request.method.toUpperCase();
+
+  if (method === "POST" && url.pathname === LOCAL_QUEUE_CONSUME_PATH) {
+    if (env.LOCAL_QUEUE_SHARED_SECRET) {
+      const providedSecret = request.headers.get(LOCAL_QUEUE_SECRET_HEADER);
+      if (providedSecret !== env.LOCAL_QUEUE_SHARED_SECRET) {
+        return json(401, { error: "Unauthorized local queue dispatch" });
+      }
+    }
+
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return json(400, { error: "Request body must be valid JSON" });
+    }
+
+    let wasAcked = false;
+    let shouldRetry = false;
+    const syntheticMessage = {
+      id: `local_${crypto.randomUUID()}`,
+      body,
+      ack() {
+        wasAcked = true;
+      },
+      retry() {
+        shouldRetry = true;
+      }
+    } satisfies Pick<Message<unknown>, "id" | "body" | "ack" | "retry">;
+
+    await processQueueMessage(env, syntheticMessage as unknown as Message<unknown>);
+    if (shouldRetry) {
+      return json(503, { ok: false, outcome: "retry" });
+    }
+
+    return json(202, { ok: true, outcome: wasAcked ? "ack" : "none" });
+  }
+
+  if (method === "GET" && url.pathname === "/healthz") {
     return json(200, {
       ok: true,
       service: "queue-consumer-worker"

@@ -21,5 +21,8 @@
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1
+  },
+  "vars": {
+    "LOCAL_QUEUE_SHARED_SECRET": ""
   }
 }
