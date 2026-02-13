@@ -21,6 +21,7 @@ interface RunExecutionRow {
   started_at: string | null;
 }
 
+const RUN_RESUME_STALE_MS = 30_000;
 const LOCAL_QUEUE_CONSUME_PATH = "/__queue/consume";
 const LOCAL_QUEUE_SECRET_HEADER = "x-bob-local-queue-secret";
 
@@ -59,6 +60,23 @@ function asStationName(value: string | null): StationName | null {
 
 function parseRunStatus(status: string): RunStatus | null {
   return isRunStatus(status) ? status : null;
+}
+
+function shouldResumeRunningRun(run: RunExecutionRow): boolean {
+  if (run.status !== "running") {
+    return false;
+  }
+
+  if (!run.started_at) {
+    return true;
+  }
+
+  const startedAt = Date.parse(run.started_at);
+  if (Number.isNaN(startedAt)) {
+    return true;
+  }
+
+  return Date.now() - startedAt >= RUN_RESUME_STALE_MS;
 }
 
 function parseForcedFailureStation(goal: string | null): StationName | null {
@@ -370,12 +388,19 @@ async function processQueueMessage(env: Env, message: Message<unknown>): Promise
 
     logEvent("run.claimed", { runId: payload.runId, messageId: message.id });
   } else if (runStatus === "running") {
-    logEvent("run.defer.running", {
+    if (!shouldResumeRunningRun(run)) {
+      logEvent("run.defer.running", {
+        runId: payload.runId,
+        messageId: message.id
+      });
+      message.retry();
+      return;
+    }
+
+    logEvent("run.resume.stale_running", {
       runId: payload.runId,
       messageId: message.id
     });
-    message.retry();
-    return;
   } else {
     logEvent("run.skip.unexpected_status", {
       runId: payload.runId,
@@ -451,11 +476,15 @@ export async function handleFetch(request: Request, env: Env): Promise<Response>
   const method = request.method.toUpperCase();
 
   if (method === "POST" && url.pathname === LOCAL_QUEUE_CONSUME_PATH) {
-    if (env.LOCAL_QUEUE_SHARED_SECRET) {
-      const providedSecret = request.headers.get(LOCAL_QUEUE_SECRET_HEADER);
-      if (providedSecret !== env.LOCAL_QUEUE_SHARED_SECRET) {
-        return json(401, { error: "Unauthorized local queue dispatch" });
-      }
+    const localQueueSecret = env.LOCAL_QUEUE_SHARED_SECRET?.trim();
+    if (!localQueueSecret) {
+      logEvent("local_queue.consume.secret_missing");
+      return json(503, { error: "Local queue consume endpoint is disabled" });
+    }
+
+    const providedSecret = request.headers.get(LOCAL_QUEUE_SECRET_HEADER);
+    if (providedSecret !== localQueueSecret) {
+      return json(401, { error: "Unauthorized local queue dispatch" });
     }
 
     let body: unknown;

@@ -240,11 +240,12 @@ function asNullableNumber(value: unknown): number | null {
   return value;
 }
 
-function createEnv(): { env: Env; db: MockD1Database } {
+function createEnv(localQueueSecret?: string): { env: Env; db: MockD1Database } {
   const db = new MockD1Database();
   return {
     env: {
-      DB: db as unknown as D1Database
+      DB: db as unknown as D1Database,
+      LOCAL_QUEUE_SHARED_SECRET: localQueueSecret
     },
     db
   };
@@ -261,6 +262,101 @@ describe("queue-consumer smoke", () => {
       ok: true,
       service: "queue-consumer-worker"
     });
+  });
+
+  it("rejects /__queue/consume when shared secret is not configured", async () => {
+    const { env } = createEnv();
+    const response = await handleFetch(
+      new Request("https://example.com/__queue/consume", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          runId: "run_missing",
+          repoId: "repo_1",
+          issueNumber: 1,
+          requestedAt: new Date().toISOString(),
+          requestor: "smoke",
+          prMode: "draft"
+        })
+      }),
+      env
+    );
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      error: "Local queue consume endpoint is disabled"
+    });
+  });
+
+  it("requires matching shared secret for /__queue/consume", async () => {
+    const { env } = createEnv("local-secret");
+    const requestBody = JSON.stringify({
+      runId: "run_missing",
+      repoId: "repo_1",
+      issueNumber: 1,
+      requestedAt: new Date().toISOString(),
+      requestor: "smoke",
+      prMode: "draft"
+    });
+
+    const unauthorized = await handleFetch(
+      new Request("https://example.com/__queue/consume", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: requestBody
+      }),
+      env
+    );
+
+    expect(unauthorized.status).toBe(401);
+    await expect(unauthorized.json()).resolves.toEqual({
+      error: "Unauthorized local queue dispatch"
+    });
+  });
+
+  it("accepts authenticated /__queue/consume dispatches", async () => {
+    const { env, db } = createEnv("local-secret");
+    db.seedRun({
+      id: "run_via_local_consume",
+      goal: null,
+      status: "queued",
+      current_station: null,
+      started_at: null,
+      finished_at: null,
+      failure_reason: null
+    });
+
+    const response = await handleFetch(
+      new Request("https://example.com/__queue/consume", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-bob-local-queue-secret": "local-secret"
+        },
+        body: JSON.stringify({
+          runId: "run_via_local_consume",
+          repoId: "repo_1",
+          issueNumber: 1,
+          requestedAt: new Date().toISOString(),
+          requestor: "smoke",
+          prMode: "draft"
+        })
+      }),
+      env
+    );
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toEqual({
+      ok: true,
+      outcome: "ack"
+    });
+    expect(db.getRun("run_via_local_consume")?.status).toBe("succeeded");
+    expect(db.stationCount("run_via_local_consume")).toBe(5);
+    expect(db.artifactCount("run_via_local_consume")).toBe(1);
   });
 
   it("processes a queued run to terminal status", async () => {

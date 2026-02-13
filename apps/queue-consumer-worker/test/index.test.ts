@@ -389,7 +389,7 @@ describe("queue-consumer worker", () => {
     expect(artifacts[0]?.type).toBe("workflow_summary");
   });
 
-  it("retries stale running runs without replaying workflow side effects", async () => {
+  it("resumes stale running runs to terminal status", async () => {
     const { env, db } = createEnv();
     db.seedRun({
       id: "run_duplicate",
@@ -417,11 +417,11 @@ describe("queue-consumer worker", () => {
       env
     );
 
-    expect(message.acked).toBe(false);
-    expect(message.retries).toBe(1);
-    expect(db.getRun("run_duplicate")?.status).toBe("running");
-    expect(db.listStations("run_duplicate")).toHaveLength(0);
-    expect(db.listArtifacts("run_duplicate")).toHaveLength(0);
+    expect(message.acked).toBe(true);
+    expect(message.retries).toBe(0);
+    expect(db.getRun("run_duplicate")?.status).toBe("succeeded");
+    expect(db.listStations("run_duplicate")).toHaveLength(5);
+    expect(db.listArtifacts("run_duplicate")).toHaveLength(1);
   });
 
   it("retries recent running runs to avoid duplicate concurrent execution", async () => {
