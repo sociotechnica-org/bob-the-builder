@@ -5,6 +5,7 @@ coverage/
 *.tsbuildinfo
 .playwright/
 .wrangler/
+.wrangler-state/
 .dev.vars
 .env
 .env.*

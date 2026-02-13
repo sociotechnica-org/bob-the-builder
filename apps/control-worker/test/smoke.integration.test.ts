@@ -8,6 +8,9 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const REQUESTED_PORT = process.env.BOB_SMOKE_PORT ? Number(process.env.BOB_SMOKE_PORT) : undefined;
+const REQUESTED_INSPECTOR_PORT = process.env.BOB_SMOKE_INSPECTOR_PORT
+  ? Number(process.env.BOB_SMOKE_INSPECTOR_PORT)
+  : undefined;
 const HOST = "127.0.0.1";
 const PASSWORD = process.env.BOB_PASSWORD ?? "replace-me";
 const PACKAGE_DIR = fileURLToPath(new URL("..", import.meta.url));
@@ -16,6 +19,7 @@ let worker: ChildProcessByStdio<null, Readable, Readable> | undefined;
 let workerStdout = "";
 let workerStderr = "";
 let port = REQUESTED_PORT ?? 0;
+let inspectorPort = REQUESTED_INSPECTOR_PORT ?? 0;
 let persistPath = "";
 
 function getBaseUrl(): string {
@@ -79,8 +83,14 @@ function startWorker(): ChildProcessByStdio<null, Readable, Readable> {
       "--local",
       "--persist-to",
       persistPath,
+      "--inspector-port",
+      String(inspectorPort),
       "--var",
       `BOB_PASSWORD:${PASSWORD}`,
+      "--var",
+      "LOCAL_QUEUE_CONSUMER_URL:",
+      "--var",
+      "LOCAL_QUEUE_SHARED_SECRET:",
       "--show-interactive-dev-session=false",
       "--log-level",
       "warn"
@@ -203,6 +213,9 @@ describe("control worker integration", () => {
   beforeAll(async () => {
     if (!REQUESTED_PORT) {
       port = await reserveOpenPort();
+    }
+    if (!REQUESTED_INSPECTOR_PORT) {
+      inspectorPort = await reserveOpenPort();
     }
 
     persistPath = await mkdtemp(join(tmpdir(), "bob-control-smoke-"));
@@ -368,7 +381,9 @@ describe("control worker integration", () => {
     expect(getRun.body).toMatchObject({
       run: {
         id: runId
-      }
+      },
+      stations: [],
+      artifacts: []
     });
   });
 });

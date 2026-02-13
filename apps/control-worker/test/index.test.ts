@@ -1,5 +1,5 @@
 import type { RunQueueMessage } from "@bob/core";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { handleRequest, type Env } from "../src/index";
 
 interface RepoRow {
@@ -38,6 +38,25 @@ interface IdempotencyRow {
   status: "pending" | "succeeded" | "failed";
   created_at: string;
   updated_at: string;
+}
+
+interface StationExecutionRow {
+  id: string;
+  run_id: string;
+  station: string;
+  status: string;
+  started_at: string | null;
+  finished_at: string | null;
+  duration_ms: number | null;
+  summary: string | null;
+}
+
+interface ArtifactRow {
+  id: string;
+  run_id: string;
+  type: string;
+  storage: string;
+  created_at: string;
 }
 
 class MockQueue {
@@ -122,6 +141,8 @@ class MockD1Database {
   private readonly repos: RepoRow[] = [];
   private readonly runs: RunRow[] = [];
   private readonly idempotencyKeys: IdempotencyRow[] = [];
+  private readonly stationExecutions: StationExecutionRow[] = [];
+  private readonly artifacts: ArtifactRow[] = [];
   public failNextIdempotencySucceededUpdate = false;
   public failNextIdempotencyFailedUpdate = false;
   public failNextRunQueueFailureMarkerUpdate = false;
@@ -203,6 +224,47 @@ class MockD1Database {
         .map((run) => this.withRepo(run));
 
       return rows;
+    }
+
+    if (sql.includes("from station_executions") && sql.includes("where run_id = ?")) {
+      const runId = asString(params[0]);
+      const stationOrder = new Map<string, number>([
+        ["intake", 0],
+        ["plan", 1],
+        ["implement", 2],
+        ["verify", 3],
+        ["create_pr", 4]
+      ]);
+      return [...this.stationExecutions]
+        .filter((row) => row.run_id === runId)
+        .sort((left, right) => {
+          const leftOrder = stationOrder.get(left.station) ?? 99;
+          const rightOrder = stationOrder.get(right.station) ?? 99;
+          if (leftOrder !== rightOrder) {
+            return leftOrder - rightOrder;
+          }
+
+          const leftStarted = left.started_at ?? "";
+          const rightStarted = right.started_at ?? "";
+          if (leftStarted !== rightStarted) {
+            return leftStarted.localeCompare(rightStarted);
+          }
+
+          return left.id.localeCompare(right.id);
+        });
+    }
+
+    if (sql.includes("from artifacts") && sql.includes("where run_id = ?")) {
+      const runId = asString(params[0]);
+      return [...this.artifacts]
+        .filter((row) => row.run_id === runId)
+        .sort((left, right) => {
+          if (left.created_at !== right.created_at) {
+            return right.created_at.localeCompare(left.created_at);
+          }
+
+          return right.id.localeCompare(left.id);
+        });
     }
 
     throw new Error(`Unsupported all SQL: ${sql}`);
@@ -381,6 +443,23 @@ class MockD1Database {
     }
 
     record.updated_at = new Date(Date.now() - offsetMs).toISOString();
+  }
+
+  public seedStationExecution(
+    runId: string,
+    row: Omit<StationExecutionRow, "run_id"> & { run_id?: string }
+  ): void {
+    this.stationExecutions.push({
+      ...row,
+      run_id: row.run_id ?? runId
+    });
+  }
+
+  public seedArtifact(runId: string, row: Omit<ArtifactRow, "run_id"> & { run_id?: string }): void {
+    this.artifacts.push({
+      ...row,
+      run_id: row.run_id ?? runId
+    });
   }
 
   private withRepo(run: RunRow): Record<string, unknown> {
@@ -612,6 +691,94 @@ describe("control worker", () => {
       env
     );
     expect(runResponse.status).toBe(200);
+    const runPayload = await parseJson(runResponse);
+    expect(runPayload).toMatchObject({
+      run: {
+        id: run.id
+      },
+      stations: [],
+      artifacts: []
+    });
+  });
+
+  it("returns station and artifact summaries on run detail endpoint", async () => {
+    const { env, db } = createEnv();
+    await createRepo(env);
+
+    const runBody = JSON.stringify({
+      repo: { owner: "sociotechnica-org", name: "lifebuild" },
+      issue: { number: 456 },
+      requestor: "jess",
+      prMode: "draft"
+    });
+
+    const createResponse = await handleRequest(
+      new Request("https://example.com/v1/runs", {
+        method: "POST",
+        headers: authHeaders({
+          "content-type": "application/json",
+          "idempotency-key": "run-details-456"
+        }),
+        body: runBody
+      }),
+      env
+    );
+    expect(createResponse.status).toBe(202);
+    const createPayload = await parseJson(createResponse);
+    const run = createPayload.run as Record<string, unknown>;
+    const runId = run.id as string;
+
+    db.seedStationExecution(runId, {
+      id: `station_${runId}_intake`,
+      station: "intake",
+      status: "succeeded",
+      started_at: new Date(Date.now() - 2000).toISOString(),
+      finished_at: new Date(Date.now() - 1500).toISOString(),
+      duration_ms: 500,
+      summary: "intake completed"
+    });
+    db.seedStationExecution(runId, {
+      id: `station_${runId}_plan`,
+      station: "plan",
+      status: "running",
+      started_at: new Date(Date.now() - 1000).toISOString(),
+      finished_at: null,
+      duration_ms: null,
+      summary: null
+    });
+    db.seedArtifact(runId, {
+      id: `artifact_${runId}`,
+      type: "workflow_summary",
+      storage: "inline",
+      created_at: new Date().toISOString()
+    });
+
+    const detailResponse = await handleRequest(
+      new Request(`https://example.com/v1/runs/${runId}`, {
+        headers: authHeaders()
+      }),
+      env
+    );
+    expect(detailResponse.status).toBe(200);
+    const detailPayload = await parseJson(detailResponse);
+    const stations = detailPayload.stations as Array<Record<string, unknown>>;
+    const artifacts = detailPayload.artifacts as Array<Record<string, unknown>>;
+
+    expect(stations).toHaveLength(2);
+    expect(stations[0]).toMatchObject({
+      station: "intake",
+      status: "succeeded"
+    });
+    expect(stations[1]).toMatchObject({
+      station: "plan",
+      status: "running"
+    });
+
+    expect(artifacts).toHaveLength(1);
+    expect(artifacts[0]).toMatchObject({
+      type: "workflow_summary",
+      storage: "inline"
+    });
   });
 
   it("cleans up created run when idempotency key claim throws", async () => {
@@ -760,6 +927,64 @@ describe("control worker", () => {
     const retryPayload = await parseJson(retryResponse);
     const idempotency = retryPayload.idempotency as Record<string, unknown>;
     expect(idempotency.requeued).toBe(true);
+  });
+
+  it("treats local queue bridge dispatch failures as non-blocking after queue send", async () => {
+    const { env, queue } = createEnv();
+    await createRepo(env);
+    env.LOCAL_QUEUE_CONSUMER_URL = "http://127.0.0.1:20288";
+    env.LOCAL_QUEUE_SHARED_SECRET = "bridge-secret";
+
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response("bridge unavailable", { status: 503 }));
+
+    try {
+      const runBody = JSON.stringify({
+        repo: { owner: "sociotechnica-org", name: "lifebuild" },
+        issue: { number: 333 },
+        requestor: "jess",
+        prMode: "draft"
+      });
+
+      const failedResponse = await handleRequest(
+        new Request("https://example.com/v1/runs", {
+          method: "POST",
+          headers: authHeaders({
+            "content-type": "application/json",
+            "idempotency-key": "local-bridge-failure"
+          }),
+          body: runBody
+        }),
+        env
+      );
+
+      expect(failedResponse.status).toBe(202);
+      const failedPayload = await parseJson(failedResponse);
+      const failedRun = failedPayload.run as Record<string, unknown>;
+      const failedIdempotency = failedPayload.idempotency as Record<string, unknown>;
+      expect(failedRun.status).toBe("queued");
+      expect(failedRun.failureReason).toBeNull();
+      expect(failedIdempotency.status).toBe("succeeded");
+      expect(queue.messages).toHaveLength(1);
+
+      const replayResponse = await handleRequest(
+        new Request("https://example.com/v1/runs", {
+          method: "POST",
+          headers: authHeaders({
+            "content-type": "application/json",
+            "idempotency-key": "local-bridge-failure"
+          }),
+          body: runBody
+        }),
+        env
+      );
+
+      expect(replayResponse.status).toBe(200);
+      expect(queue.messages).toHaveLength(1);
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
   it("retries queue publish when failed idempotency update throws after enqueue error", async () => {

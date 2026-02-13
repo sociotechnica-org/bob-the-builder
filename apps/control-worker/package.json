@@ -7,7 +7,7 @@
   "types": "src/index.ts",
   "scripts": {
     "dev": "wrangler dev",
-    "dev:local": "wrangler dev --local --port 20287 --ip 127.0.0.1 --inspector-port 20830",
+    "dev:local": "wrangler dev --local --port 20287 --ip 127.0.0.1 --inspector-port 20830 --persist-to ../../.wrangler-state",
     "lint": "eslint src test --ext .ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run test/index.test.ts",

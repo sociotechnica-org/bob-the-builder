@@ -1,1 +1,1 @@
-# Add local vars here as needed
+LOCAL_QUEUE_SHARED_SECRET=replace-me-local-queue-secret

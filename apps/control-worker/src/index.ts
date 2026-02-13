@@ -9,12 +9,16 @@ const QUEUE_FAILURE_REASON = "queue_publish_failed";
 const DEFAULT_LIST_LIMIT = 50;
 const MAX_LIST_LIMIT = 100;
 const TEXT_ENCODER = new TextEncoder();
+const LOCAL_QUEUE_CONSUME_PATH = "/__queue/consume";
+const LOCAL_QUEUE_SECRET_HEADER = "x-bob-local-queue-secret";
 
 type IdempotencyStatus = "pending" | "succeeded" | "failed";
 
 export interface Env extends PasswordEnv {
   DB: D1Database;
   RUN_QUEUE: Queue<RunQueueMessage>;
+  LOCAL_QUEUE_CONSUMER_URL?: string;
+  LOCAL_QUEUE_SHARED_SECRET?: string;
 }
 
 interface RepoRow {
@@ -49,6 +53,25 @@ interface RunRow {
 interface RunWithRepoRow extends RunRow {
   repo_owner: string;
   repo_name: string;
+}
+
+interface StationExecutionRow {
+  id: string;
+  run_id: string;
+  station: string;
+  status: string;
+  started_at: string | null;
+  finished_at: string | null;
+  duration_ms: number | null;
+  summary: string | null;
+}
+
+interface ArtifactSummaryRow {
+  id: string;
+  run_id: string;
+  type: string;
+  storage: string;
+  created_at: string;
 }
 
 interface IdempotencyRow {
@@ -289,6 +312,29 @@ function serializeRun(row: RunWithRepoRow): Record<string, unknown> {
   };
 }
 
+function serializeStationExecution(row: StationExecutionRow): Record<string, unknown> {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    station: row.station,
+    status: row.status,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+    durationMs: row.duration_ms,
+    summary: row.summary
+  };
+}
+
+function serializeArtifactSummary(row: ArtifactSummaryRow): Record<string, unknown> {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    type: row.type,
+    storage: row.storage,
+    createdAt: row.created_at
+  };
+}
+
 function parseRunId(pathname: string): string | null {
   const match = pathname.match(/^\/v1\/runs\/([^/]+)$/);
   if (!match) {
@@ -460,6 +506,48 @@ async function listRuns(env: Env, filters: ListRunsFilters): Promise<RunWithRepo
 
   const statement = env.DB.prepare(query).bind(...binds);
   const result = await statement.all<RunWithRepoRow>();
+  return result.results ?? [];
+}
+
+async function listStationExecutionsByRunId(
+  env: Env,
+  runId: string
+): Promise<StationExecutionRow[]> {
+  const result = await env.DB.prepare(
+    `SELECT id, run_id, station, status, started_at, finished_at, duration_ms, summary
+     FROM station_executions
+     WHERE run_id = ?
+     ORDER BY
+      CASE station
+        WHEN 'intake' THEN 0
+        WHEN 'plan' THEN 1
+        WHEN 'implement' THEN 2
+        WHEN 'verify' THEN 3
+        WHEN 'create_pr' THEN 4
+        ELSE 5
+      END ASC,
+      started_at ASC,
+      id ASC`
+  )
+    .bind(runId)
+    .all<StationExecutionRow>();
+
+  return result.results ?? [];
+}
+
+async function listArtifactSummariesByRunId(
+  env: Env,
+  runId: string
+): Promise<ArtifactSummaryRow[]> {
+  const result = await env.DB.prepare(
+    `SELECT id, run_id, type, storage, created_at
+     FROM artifacts
+     WHERE run_id = ?
+     ORDER BY created_at DESC, id DESC`
+  )
+    .bind(runId)
+    .all<ArtifactSummaryRow>();
+
   return result.results ?? [];
 }
 
@@ -690,8 +778,64 @@ function buildQueueMessage(run: RunWithRepoRow): RunQueueMessage {
   };
 }
 
+async function dispatchLocalQueueMessageBestEffort(
+  env: Env,
+  run: RunWithRepoRow,
+  message: RunQueueMessage
+): Promise<void> {
+  const rawConsumerUrl = env.LOCAL_QUEUE_CONSUMER_URL;
+  if (!isNonEmptyString(rawConsumerUrl)) {
+    return;
+  }
+
+  const consumerUrl = rawConsumerUrl.trim().replace(/\/+$/, "");
+  const endpoint = `${consumerUrl}${LOCAL_QUEUE_CONSUME_PATH}`;
+  const headers: Record<string, string> = {
+    "content-type": "application/json"
+  };
+
+  if (isNonEmptyString(env.LOCAL_QUEUE_SHARED_SECRET)) {
+    headers[LOCAL_QUEUE_SECRET_HEADER] = env.LOCAL_QUEUE_SHARED_SECRET.trim();
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(message)
+    });
+  } catch (error) {
+    logEvent("run.local_queue_bridge.error", {
+      runId: run.id,
+      endpoint,
+      error: errorMessage(error)
+    });
+    return;
+  }
+
+  if (!response.ok) {
+    const body = (await response.text()).slice(0, 500);
+    logEvent("run.local_queue_bridge.failed", {
+      runId: run.id,
+      endpoint,
+      status: response.status,
+      body
+    });
+    return;
+  }
+
+  logEvent("run.local_queue_bridge.dispatched", {
+    runId: run.id,
+    endpoint
+  });
+}
+
 async function enqueueRun(env: Env, run: RunWithRepoRow): Promise<void> {
-  await env.RUN_QUEUE.send(buildQueueMessage(run));
+  const message = buildQueueMessage(run);
+  // The durable queue is the source of truth; local bridge is best-effort for local dev wiring.
+  await env.RUN_QUEUE.send(message);
+  await dispatchLocalQueueMessageBestEffort(env, run, message);
 }
 
 function serializeIdempotency(
@@ -1070,7 +1214,16 @@ async function handleGetRun(runId: string, env: Env): Promise<Response> {
       return routeNotFound();
     }
 
-    return json(200, { run: serializeRun(run) });
+    const [stations, artifacts] = await Promise.all([
+      listStationExecutionsByRunId(env, runId),
+      listArtifactSummariesByRunId(env, runId)
+    ]);
+
+    return json(200, {
+      run: serializeRun(run),
+      stations: stations.map(serializeStationExecution),
+      artifacts: artifacts.map(serializeArtifactSummary)
+    });
   } catch (error) {
     logEvent("run.get.failed", {
       runId,

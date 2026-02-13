@@ -68,7 +68,11 @@ importers:
         specifier: workspace:*
         version: link:../../packages/security
 
-  apps/queue-consumer-worker: {}
+  apps/queue-consumer-worker:
+    dependencies:
+      "@bob/core":
+        specifier: workspace:*
+        version: link:../../packages/core
 
   apps/web:
     dependencies:
