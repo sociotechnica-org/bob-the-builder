@@ -1,5 +1,10 @@
 # chip
 
+<p align="center">
+  <img src="assets/chip-wooden-blank.png" alt="Chip" width="400"/>
+</p>
+
+
 `chip` is a Cloudflare-first software factory that turns GitHub issues into pull requests.
 
 ## Intent
